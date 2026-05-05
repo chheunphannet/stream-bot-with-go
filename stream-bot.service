@@ -1,0 +1,15 @@
+[Unit]
+Description=Khdiamond Telegram Stream Bot
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/stream-bot
+EnvironmentFile=/opt/stream-bot/.env
+ExecStart=/opt/stream-bot/stream-bot
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
