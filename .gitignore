@@ -1,0 +1,11 @@
+# Binaries
+stream-bot
+
+# Environment variables
+.env
+
+# Stats
+stats.json
+
+# Local logs
+_summary.txt
