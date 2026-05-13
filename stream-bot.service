@@ -1,6 +1,7 @@
 [Unit]
 Description=Khdiamond Telegram Stream Bot
-After=network.target
+Wants=network-online.target
+After=network-online.target
 
 [Service]
 Type=simple
@@ -10,6 +11,11 @@ EnvironmentFile=/opt/stream-bot/.env
 ExecStart=/opt/stream-bot/stream-bot
 Restart=always
 RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/opt/stream-bot
 
 [Install]
 WantedBy=multi-user.target

@@ -1,11 +1,17 @@
 # Binaries
 stream-bot
+stream-bot-*
+*.exe
 
 # Environment variables
 .env
 
-# Stats
+# Local data
 stats.json
+stats.db
+stats.db-*
 
-# Local logs
+# Local build/cache/backup files
+.gocache/
+backup-*/
 _summary.txt

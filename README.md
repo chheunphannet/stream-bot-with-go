@@ -1,70 +1,76 @@
 # Khdiamond Stream Bot
 
-A Telegram bot written in Go that extracts embed stream URLs from `khdiamond.net`. It supports both movies and TV shows, tracks usage statistics, and includes deployment scripts for systemd.
-
-## Features
-
-- **Stream Extraction**: Automatically fetches embed URLs from `khdiamond.net`.
-- **Media Support**: Handles both Movie and TV Show content.
-- **Usage Statistics**: Tracks total requests and identifies top users (saved in `stats.json`).
-- **Asynchronous Processing**: Uses Go routines for non-blocking update handling.
-- **Production Ready**: Includes a systemd service file and a deployment script for easy VPS setup.
+A Telegram bot written in Go that extracts embed stream URLs from `khdiamond.net`, supports movies and TV episodes, and stores usage stats in SQLite.
 
 ## Commands
 
-- `/start`: Displays the welcome message.
-- `/count_process`: Shows usage statistics (total users, total requests, and top 5 users).
+- `/start`: show the welcome message.
+- `/count_process`: show total users, total requests, and top users.
 
-## Getting Started
+## Local Run
 
-### Prerequisites
+1. Create `.env`:
 
-- Go 1.21 or higher
-- A Telegram Bot Token (obtainable from [@BotFather](https://t.me/BotFather))
+   ```bash
+   cp .env.example .env
+   nano .env
+   ```
 
-### Setup
+2. Set your Telegram bot token:
 
-1.  **Clone the repository**:
-    ```bash
-    git clone https://github.com/chheunphannet/stream-bot-with-go.git
-    cd stream-bot-with-go
-    ```
+   ```env
+   BOT_TOKEN=your_telegram_bot_token_here
+   ```
 
-2.  **Configure environment variables**:
-    Create a `.env` file in the root directory and add your bot token:
-    ```env
-    BOT_TOKEN=your_telegram_bot_token_here
-    ```
+3. Run:
 
-3.  **Install dependencies**:
-    ```bash
-    go mod tidy
-    ```
+   ```bash
+   go run .
+   ```
 
-4.  **Run the bot**:
-    ```bash
-    go run main.go
-    ```
+The bot keeps running until you stop it with `Ctrl+C`.
 
-## Deployment
+## VPS Deployment
 
-To deploy the bot on a Linux VPS (e.g., Ubuntu):
+Tested for Ubuntu-style VPS servers with systemd.
 
-1.  Edit `deploy.sh` and `stream-bot.service` if you need to change paths or the user.
-2.  Run the deployment script:
-    ```bash
-    chmod +x deploy.sh
-    ./deploy.sh
-    ```
-3.  Check the service status:
-    ```bash
-    sudo systemctl status stream-bot
-    ```
-4.  View logs:
-    ```bash
-    sudo journalctl -u stream-bot -f
-    ```
+1. Install Go 1.21 or newer on the VPS.
 
-## License
+2. Upload or clone this project, then create `.env`:
 
-This project is for educational purposes. Ensure you comply with the terms of service of the target website.
+   ```bash
+   cp .env.example .env
+   nano .env
+   ```
+
+3. Deploy:
+
+   ```bash
+   chmod +x deploy.sh
+   ./deploy.sh
+   ```
+
+By default the service is installed to `/opt/stream-bot` and runs as the user who runs `deploy.sh` with sudo access. To choose a different service user:
+
+```bash
+SERVICE_USER=ubuntu ./deploy.sh
+```
+
+If `stats.db` exists in the project folder, the deploy script copies it only when `/opt/stream-bot/stats.db` does not already exist. This protects production stats from being overwritten.
+
+## Service Commands
+
+```bash
+sudo systemctl status stream-bot
+sudo systemctl restart stream-bot
+sudo systemctl stop stream-bot
+sudo journalctl -u stream-bot -f
+```
+
+## Files
+
+- `main.go`: bot source code.
+- `stats.db`: SQLite stats database, created automatically at runtime.
+- `.env`: production token file, not committed.
+- `stream-bot.service`: systemd service template.
+- `deploy.sh`: VPS build and install script.
