@@ -27,8 +27,8 @@ const (
 	cookieFile   = "cookies.txt"
 )
 
-// Exact User-Agent from your working Laravel app
-const userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+// EXACT User-Agent from your Laravel StreamService.php
+const userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
 
 // ── Database & Stats ───────────────────────────────────────────────────────
 
@@ -145,7 +145,7 @@ func (s *Stats) report() string {
 	)
 }
 
-// ── HTTP Client (cURL Wrapper with Cookie Session) ─────────────────────────
+// ── HTTP Client (cURL Wrapper - Minimalist Laravel Style) ──────────────────
 
 func doRequest(method, targetURL, referer string, bodyStr string) (string, error) {
 	args := []string{
@@ -153,17 +153,10 @@ func doRequest(method, targetURL, referer string, bodyStr string) (string, error
 		"-L",           // follow redirects
 		"-k",           // insecure
 		"--compressed", // handle gzip/br
-		"-b", cookieFile, // Load cookies
-		"-c", cookieFile, // Save cookies
+		"-b", cookieFile,
+		"-c", cookieFile,
 		"-X", method,
 		"-H", "User-Agent: " + userAgent,
-		"-H", "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-		"-H", "Accept-Language: en-US,en;q=0.9,km;q=0.8",
-		"-H", "Upgrade-Insecure-Requests: 1",
-		"-H", "Sec-Fetch-Dest: document",
-		"-H", "Sec-Fetch-Mode: navigate",
-		"-H", "Sec-Fetch-Site: none",
-		"-H", "Sec-Fetch-User: ?1",
 	}
 
 	if referer != "" {
@@ -209,14 +202,11 @@ type embedResponse struct {
 }
 
 func getKhdiamondStream(pageURL string) (string, string, string, error) {
-	html, err := fetchHTML(pageURL, baseReferer)
+	// Match Laravel's fetchHtml($url, "https://$host")
+	u, _ := url.Parse(pageURL)
+	html, err := fetchHTML(pageURL, fmt.Sprintf("%s://%s", u.Scheme, u.Host))
 	if err != nil {
 		return "", "", "", err
-	}
-
-	mediaType := "movie"
-	if strings.Contains(html, "single-episodes") || strings.Contains(html, "single-tvshows") || strings.Contains(pageURL, "/episodes/") || strings.Contains(pageURL, "/tvshows/") {
-		mediaType = "tv"
 	}
 
 	// Cloudflare detection
@@ -226,7 +216,12 @@ func getKhdiamondStream(pageURL string) (string, string, string, error) {
 			snippet = snippet[:300]
 		}
 		log.Printf("DEBUG: Blocked by Cloudflare. Received: %s", snippet)
-		return "", "", "", fmt.Errorf("Cloudflare challenge detected. This VPS IP might be flagged. Try again in 5 minutes")
+		return "", "", "", fmt.Errorf("Cloudflare challenge detected. This VPS IP might be flagged")
+	}
+
+	mediaType := "movie"
+	if strings.Contains(html, "single-episodes") || strings.Contains(html, "single-tvshows") || strings.Contains(pageURL, "/episodes/") || strings.Contains(pageURL, "/tvshows/") {
+		mediaType = "tv"
 	}
 
 	title := "Unknown"
@@ -277,6 +272,7 @@ func getKhdiamondStream(pageURL string) (string, string, string, error) {
 	form.Set("nume", "1")
 	form.Set("type", mediaType)
 
+	// Match Laravel's getEmbedUrl with Referer = pageUrl
 	ajaxResp, err := doRequest("POST", ajaxEndpoint, pageURL, form.Encode())
 	if err != nil {
 		return "", "", "", err
