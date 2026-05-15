@@ -1,20 +1,19 @@
 package main
 
 import (
+	"crypto/tls"
 	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"net/http"
 	"net/url"
 	"os"
 	"regexp"
 	"strings"
 	"time"
 
-	fhttp "github.com/bogdanfinn/fhttp"
-	tls_client "github.com/bogdanfinn/tls-client"
-	"github.com/bogdanfinn/tls-client/profiles"
 	_ "github.com/glebarez/go-sqlite"
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/joho/godotenv"
@@ -25,25 +24,11 @@ import (
 const (
 	dbFile       = "stats.db"
 	ajaxEndpoint = "https://khdiamond.net/wp-admin/admin-ajax.php"
-	baseReferer  = "https://khdiamond.net/"
+	baseReferer  = "https://khdiamond.net"
 )
 
-var defaultHeaders = map[string]string{
-	"User-Agent":                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-	"Accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-	"Accept-Language":           "en-US,en;q=0.9,km;q=0.8",
-	"Accept-Encoding":           "gzip, deflate, br",
-	"Cache-Control":             "max-age=0",
-	"Connection":                "keep-alive",
-	"Sec-Ch-Ua":                 "\"Not_A Brand\";v=\"8\", \"Chromium\";v=\"120\", \"Google Chrome\";v=\"120\"",
-	"Sec-Ch-Ua-Mobile":          "?0",
-	"Sec-Ch-Ua-Platform":        "\"Windows\"",
-	"Sec-Fetch-Dest":            "document",
-	"Sec-Fetch-Mode":            "navigate",
-	"Sec-Fetch-Site":            "none",
-	"Sec-Fetch-User":            "?1",
-	"Upgrade-Insecure-Requests": "1",
-}
+// Exact User-Agent from your working Laravel app
+const userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
 
 // ── Database & Stats ───────────────────────────────────────────────────────
 
@@ -160,39 +145,31 @@ func (s *Stats) report() string {
 	)
 }
 
-// ── HTTP Client (Cloudflare Bypass) ────────────────────────────────────────
+// ── HTTP Client (Matching Laravel settings) ────────────────────────────────
 
-var httpClient tls_client.HttpClient
-
-func init() {
-	options := []tls_client.HttpClientOption{
-		tls_client.WithClientProfile(profiles.Chrome_120),
-		tls_client.WithTimeoutSeconds(30),
-		tls_client.WithCookieJar(tls_client.NewCookieJar()), // Enable cookie support
-	}
-	client, err := tls_client.NewHttpClient(tls_client.NewNoopLogger(), options...)
-	if err != nil {
-		log.Fatal("Failed to create TLS client:", err)
-	}
-	httpClient = client
+var httpClient = &http.Client{
+	Timeout: 30 * time.Second,
+	Transport: &http.Transport{
+		// Force HTTP/1.1 as Cloudflare is more lenient with it
+		ForceAttemptHTTP2: false,
+		// Match Laravel's withoutVerifying()
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	},
 }
 
 func doRequest(method, targetURL, referer string, body io.Reader) (string, error) {
-	req, err := fhttp.NewRequest(method, targetURL, body)
+	req, err := http.NewRequest(method, targetURL, body)
 	if err != nil {
 		return "", err
 	}
 
-	for k, v := range defaultHeaders {
-		req.Header.Set(k, v)
-	}
+	// Simple headers, exactly like your PHP StreamService.php
+	req.Header.Set("User-Agent", userAgent)
 	if referer != "" {
 		req.Header.Set("Referer", referer)
-		req.Header.Set("Sec-Fetch-Site", "same-origin")
 	}
 	if method == "POST" {
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-		req.Header.Set("Origin", "https://khdiamond.net")
 	}
 
 	resp, err := httpClient.Do(req)
@@ -201,11 +178,8 @@ func doRequest(method, targetURL, referer string, body io.Reader) (string, error
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == 403 {
-		return "", fmt.Errorf("Cloudflare is blocking your Singapore VPS IP (403 Forbidden). Please move to a Cambodia VPS or use a Proxy")
-	}
-
-	if resp.StatusCode != fhttp.StatusOK {
+	if resp.StatusCode != http.StatusOK {
+		// Log the error for debugging
 		return "", fmt.Errorf("failed to fetch %s (%d)", targetURL, resp.StatusCode)
 	}
 
@@ -231,7 +205,9 @@ type embedResponse struct {
 }
 
 func getKhdiamondStream(pageURL string) (string, string, string, error) {
-	html, err := fetchHTML(pageURL, "")
+	// Laravel uses the site root as referer for the initial fetch
+	u, _ := url.Parse(pageURL)
+	html, err := fetchHTML(pageURL, fmt.Sprintf("%s://%s", u.Scheme, u.Host))
 	if err != nil {
 		return "", "", "", err
 	}
@@ -289,6 +265,7 @@ func getKhdiamondStream(pageURL string) (string, string, string, error) {
 	form.Set("nume", "1")
 	form.Set("type", mediaType)
 
+	// In Laravel, the pageURL is used as referer for the AJAX call
 	ajaxResp, err := doRequest("POST", ajaxEndpoint, pageURL, strings.NewReader(form.Encode()))
 	if err != nil {
 		return "", "", "", err
