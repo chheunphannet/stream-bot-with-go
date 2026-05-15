@@ -24,10 +24,11 @@ const (
 	dbFile       = "stats.db"
 	ajaxEndpoint = "https://khdiamond.net/wp-admin/admin-ajax.php"
 	baseReferer  = "https://khdiamond.net"
+	cookieFile   = "cookies.txt"
 )
 
 // Exact User-Agent from your working Laravel app
-const userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
+const userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 // ── Database & Stats ───────────────────────────────────────────────────────
 
@@ -144,16 +145,25 @@ func (s *Stats) report() string {
 	)
 }
 
-// ── HTTP Client (Matching Laravel settings) ────────────────────────────────
+// ── HTTP Client (cURL Wrapper with Cookie Session) ─────────────────────────
 
 func doRequest(method, targetURL, referer string, bodyStr string) (string, error) {
 	args := []string{
 		"-s",           // silent
-		"-L",           // follow redirects (important!)
+		"-L",           // follow redirects
 		"-k",           // insecure
-		"--compressed", // handle gzip/deflate automatically
+		"--compressed", // handle gzip/br
+		"-b", cookieFile, // Load cookies
+		"-c", cookieFile, // Save cookies
 		"-X", method,
 		"-H", "User-Agent: " + userAgent,
+		"-H", "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+		"-H", "Accept-Language: en-US,en;q=0.9,km;q=0.8",
+		"-H", "Upgrade-Insecure-Requests: 1",
+		"-H", "Sec-Fetch-Dest: document",
+		"-H", "Sec-Fetch-Mode: navigate",
+		"-H", "Sec-Fetch-Site: none",
+		"-H", "Sec-Fetch-User: ?1",
 	}
 
 	if referer != "" {
@@ -199,9 +209,7 @@ type embedResponse struct {
 }
 
 func getKhdiamondStream(pageURL string) (string, string, string, error) {
-	// Laravel uses the site root as referer for the initial fetch
-	u, _ := url.Parse(pageURL)
-	html, err := fetchHTML(pageURL, fmt.Sprintf("%s://%s", u.Scheme, u.Host))
+	html, err := fetchHTML(pageURL, baseReferer)
 	if err != nil {
 		return "", "", "", err
 	}
@@ -209,6 +217,16 @@ func getKhdiamondStream(pageURL string) (string, string, string, error) {
 	mediaType := "movie"
 	if strings.Contains(html, "single-episodes") || strings.Contains(html, "single-tvshows") || strings.Contains(pageURL, "/episodes/") || strings.Contains(pageURL, "/tvshows/") {
 		mediaType = "tv"
+	}
+
+	// Cloudflare detection
+	if strings.Contains(html, "Just a moment...") || strings.Contains(html, "cf-challenge") {
+		snippet := html
+		if len(snippet) > 300 {
+			snippet = snippet[:300]
+		}
+		log.Printf("DEBUG: Blocked by Cloudflare. Received: %s", snippet)
+		return "", "", "", fmt.Errorf("Cloudflare challenge detected. This VPS IP might be flagged. Try again in 5 minutes")
 	}
 
 	title := "Unknown"
@@ -249,16 +267,7 @@ func getKhdiamondStream(pageURL string) (string, string, string, error) {
 
 	matches := postIDRegex.FindStringSubmatch(html)
 	if matches == nil {
-		snippet := html
-		if len(snippet) > 300 {
-			snippet = snippet[:300]
-		}
-		log.Printf("DEBUG: Regex failed. HTML starts with: %s", snippet)
-
-		if strings.Contains(html, "cf-challenge") || strings.Contains(html, "Checking your browser") {
-			return "", "", "", fmt.Errorf("Cloudflare challenge detected. Please try again later or use a proxy")
-		}
-		return "", "", "", fmt.Errorf("no post ID found on page")
+		return "", "", "", fmt.Errorf("no post ID found on page. (Site might have changed structure)")
 	}
 	postID := matches[1]
 
@@ -268,7 +277,6 @@ func getKhdiamondStream(pageURL string) (string, string, string, error) {
 	form.Set("nume", "1")
 	form.Set("type", mediaType)
 
-	// In Laravel, the pageURL is used as referer for the AJAX call
 	ajaxResp, err := doRequest("POST", ajaxEndpoint, pageURL, form.Encode())
 	if err != nil {
 		return "", "", "", err
