@@ -25,17 +25,24 @@ import (
 const (
 	dbFile       = "stats.db"
 	ajaxEndpoint = "https://khdiamond.net/wp-admin/admin-ajax.php"
-	baseReferer  = "https://khdiamond.net"
+	baseReferer  = "https://khdiamond.net/"
 )
 
 var defaultHeaders = map[string]string{
-	"User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-	"Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-	"Accept-Language": "en-US,en;q=0.9",
-	"Sec-Fetch-Dest":  "document",
-	"Sec-Fetch-Mode":  "navigate",
-	"Sec-Fetch-Site":  "same-origin",
-	"Sec-Fetch-User":  "?1",
+	"User-Agent":                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+	"Accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+	"Accept-Language":           "en-US,en;q=0.9,km;q=0.8",
+	"Accept-Encoding":           "gzip, deflate, br",
+	"Cache-Control":             "max-age=0",
+	"Connection":                "keep-alive",
+	"Sec-Ch-Ua":                 "\"Not_A Brand\";v=\"8\", \"Chromium\";v=\"120\", \"Google Chrome\";v=\"120\"",
+	"Sec-Ch-Ua-Mobile":          "?0",
+	"Sec-Ch-Ua-Platform":        "\"Windows\"",
+	"Sec-Fetch-Dest":            "document",
+	"Sec-Fetch-Mode":            "navigate",
+	"Sec-Fetch-Site":            "none",
+	"Sec-Fetch-User":            "?1",
+	"Upgrade-Insecure-Requests": "1",
 }
 
 // ── Database & Stats ───────────────────────────────────────────────────────
@@ -161,6 +168,7 @@ func init() {
 	options := []tls_client.HttpClientOption{
 		tls_client.WithClientProfile(profiles.Chrome_120),
 		tls_client.WithTimeoutSeconds(30),
+		tls_client.WithCookieJar(tls_client.NewCookieJar()), // Enable cookie support
 	}
 	client, err := tls_client.NewHttpClient(tls_client.NewNoopLogger(), options...)
 	if err != nil {
@@ -180,9 +188,11 @@ func doRequest(method, targetURL, referer string, body io.Reader) (string, error
 	}
 	if referer != "" {
 		req.Header.Set("Referer", referer)
+		req.Header.Set("Sec-Fetch-Site", "same-origin")
 	}
 	if method == "POST" {
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Header.Set("Origin", "https://khdiamond.net")
 	}
 
 	resp, err := httpClient.Do(req)
@@ -190,6 +200,10 @@ func doRequest(method, targetURL, referer string, body io.Reader) (string, error
 		return "", err
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode == 403 {
+		return "", fmt.Errorf("Cloudflare is blocking your Singapore VPS IP (403 Forbidden). Please move to a Cambodia VPS or use a Proxy")
+	}
 
 	if resp.StatusCode != fhttp.StatusOK {
 		return "", fmt.Errorf("failed to fetch %s (%d)", targetURL, resp.StatusCode)
@@ -217,7 +231,7 @@ type embedResponse struct {
 }
 
 func getKhdiamondStream(pageURL string) (string, string, string, error) {
-	html, err := fetchHTML(pageURL, baseReferer)
+	html, err := fetchHTML(pageURL, "")
 	if err != nil {
 		return "", "", "", err
 	}
