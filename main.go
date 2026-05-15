@@ -3,18 +3,18 @@ package main
 import (
 	"database/sql"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"html"
 	"io"
 	"log"
-	"net/http"
 	"net/url"
 	"os"
 	"regexp"
 	"strings"
 	"time"
 
+	fhttp "github.com/bogdanfinn/fhttp"
+	tls_client "github.com/bogdanfinn/tls-client"
+	"github.com/bogdanfinn/tls-client/profiles"
 	_ "github.com/glebarez/go-sqlite"
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/joho/godotenv"
@@ -29,7 +29,13 @@ const (
 )
 
 var defaultHeaders = map[string]string{
-	"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+	"User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+	"Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+	"Accept-Language": "en-US,en;q=0.9",
+	"Sec-Fetch-Dest":  "document",
+	"Sec-Fetch-Mode":  "navigate",
+	"Sec-Fetch-Site":  "same-origin",
+	"Sec-Fetch-User":  "?1",
 }
 
 // ── Database & Stats ───────────────────────────────────────────────────────
@@ -39,14 +45,13 @@ type Stats struct {
 }
 
 func initDB() *Stats {
-	// Open with WAL mode and busy timeout for concurrent safety
+	_ = godotenv.Load()
 	dsn := fmt.Sprintf("%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)", dbFile)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		log.Fatal("Failed to open database:", err)
 	}
 
-	// Optimize for single-writer
 	db.SetMaxOpenConns(1)
 
 	query := `
@@ -64,7 +69,7 @@ func initDB() *Stats {
 		log.Fatal("Failed to create table:", err)
 	}
 
-	// Migration: Ensure new columns exist
+	// Migration
 	_, _ = db.Exec("ALTER TABLE users ADD COLUMN last_msg_id INTEGER;")
 	_, _ = db.Exec("ALTER TABLE users ADD COLUMN next_url TEXT;")
 
@@ -122,8 +127,7 @@ func (s *Stats) getLastInfo(chatID int64) (string, string, int, error) {
 func (s *Stats) report() string {
 	var totalUsers int
 	var totalRequests int
-
-	s.db.QueryRow("SELECT COUNT(*), COALESCE(SUM(request_count), 0) FROM users").Scan(&totalUsers, &totalRequests)
+	_ = s.db.QueryRow("SELECT COUNT(*), SUM(request_count) FROM users").Scan(&totalUsers, &totalRequests)
 
 	rows, err := s.db.Query("SELECT username, request_count FROM users ORDER BY request_count DESC LIMIT 5")
 	if err != nil {
@@ -149,21 +153,37 @@ func (s *Stats) report() string {
 	)
 }
 
-// ── HTTP Client ────────────────────────────────────────────────────────────
+// ── HTTP Client (Cloudflare Bypass) ────────────────────────────────────────
 
-var httpClient = &http.Client{
-	Timeout: 30 * time.Second,
+var httpClient tls_client.HttpClient
+
+func init() {
+	options := []tls_client.HttpClientOption{
+		tls_client.WithClientProfile(profiles.Chrome_120),
+		tls_client.WithTimeoutSeconds(30),
+	}
+	client, err := tls_client.NewHttpClient(tls_client.NewNoopLogger(), options...)
+	if err != nil {
+		log.Fatal("Failed to create TLS client:", err)
+	}
+	httpClient = client
 }
 
-func fetchHTML(pageURL, referer string) (string, error) {
-	req, err := http.NewRequest("GET", pageURL, nil)
+func doRequest(method, targetURL, referer string, body io.Reader) (string, error) {
+	req, err := fhttp.NewRequest(method, targetURL, body)
 	if err != nil {
 		return "", err
 	}
+
 	for k, v := range defaultHeaders {
 		req.Header.Set(k, v)
 	}
-	req.Header.Set("Referer", referer)
+	if referer != "" {
+		req.Header.Set("Referer", referer)
+	}
+	if method == "POST" {
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	}
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
@@ -171,40 +191,29 @@ func fetchHTML(pageURL, referer string) (string, error) {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("failed to fetch %s (%d)", pageURL, resp.StatusCode)
+	if resp.StatusCode != fhttp.StatusOK {
+		return "", fmt.Errorf("failed to fetch %s (%d)", targetURL, resp.StatusCode)
 	}
 
-	body, err := io.ReadAll(resp.Body)
-	return string(body), err
+	data, err := io.ReadAll(resp.Body)
+	return string(data), err
 }
 
-var postIDRegex = regexp.MustCompile(`postid-(\d+)`)
-
-type embedResponse struct {
-	EmbedURL string `json:"embed_url"`
-	Type     any    `json:"type"`
+func fetchHTML(pageURL, referer string) (string, error) {
+	return doRequest("GET", pageURL, referer, nil)
 }
-
-var nextURLRegex = regexp.MustCompile(`<a href=['"]([^'"]+)['"][^>]*>\s*<span>ភាគបន្ទាប់</span>`)
 
 var (
+	postIDRegex  = regexp.MustCompile(`postid-(\d+)`)
+	nextURLRegex = regexp.MustCompile(`<a href=['"]([^'"]+)['"][^>]*>\s*<span>ភាគបន្ទាប់</span>`)
 	titleRegex   = regexp.MustCompile(`<h1[^>]*>([^<]+)</h1>`)
 	numRegex     = regexp.MustCompile(`(\d+)x(\d+)|S(\d+)\s*-\s*E(\d+)`)
 	cleanupRegex = regexp.MustCompile(`[:\-\s]+$`)
 )
 
-var errPageNotAvailable = errors.New("page not available")
-
-func cleanEnglishTitle(rawTitle string) string {
-	title := html.UnescapeString(strings.TrimSpace(rawTitle))
-	for _, separator := range []string{"\u2013", "\u2014"} {
-		parts := strings.Split(title, separator)
-		if len(parts) > 1 {
-			return strings.TrimSpace(parts[len(parts)-1])
-		}
-	}
-	return title
+type embedResponse struct {
+	EmbedURL string `json:"embed_url"`
+	Type     any    `json:"type"`
 }
 
 func getKhdiamondStream(pageURL string) (string, string, string, error) {
@@ -213,50 +222,40 @@ func getKhdiamondStream(pageURL string) (string, string, string, error) {
 		return "", "", "", err
 	}
 
-	// Detect media type
 	mediaType := "movie"
 	if strings.Contains(html, "single-episodes") || strings.Contains(html, "single-tvshows") || strings.Contains(pageURL, "/episodes/") || strings.Contains(pageURL, "/tvshows/") {
 		mediaType = "tv"
 	}
 
-	// Extract Title
 	title := "Unknown"
 	titleMatches := titleRegex.FindStringSubmatch(html)
 	if len(titleMatches) > 1 {
-		title = cleanEnglishTitle(titleMatches[1])
+		title = strings.TrimSpace(titleMatches[1])
 	}
 
-	// Extract Next URL
 	nextURL := ""
 	if mediaType == "tv" {
 		nextMatches := nextURLRegex.FindStringSubmatch(html)
 		if len(nextMatches) > 1 {
-			nextURL = resolvePageURL(nextMatches[1])
+			nextURL = nextMatches[1]
 		}
 	}
 
-	// Parse Season/Episode and clean title
 	metaInfo := ""
 	if mediaType == "tv" {
 		numMatches := numRegex.FindStringSubmatch(title)
 		if len(numMatches) == 0 {
-			// Try finding in the 'numerando' div if title doesn't have it
 			numMatches = numRegex.FindStringSubmatch(html)
-		}
-		if len(numMatches) == 0 {
-			numMatches = numRegex.FindStringSubmatch(pageURL)
 		}
 
 		if len(numMatches) > 0 {
 			s, e := "", ""
-			if numMatches[1] != "" { // 1x1 format
+			if numMatches[1] != "" {
 				s, e = numMatches[1], numMatches[2]
-			} else { // S1 - E1 format
+			} else {
 				s, e = numMatches[3], numMatches[4]
 			}
-			metaInfo = fmt.Sprintf("\nSeason: %s Episode: %s", s, e)
-
-			// Remove the episode part from title for display if it's there
+			metaInfo = fmt.Sprintf("\nSeason: %s, Ep: %s", s, e)
 			title = numRegex.ReplaceAllString(title, "")
 			title = cleanupRegex.ReplaceAllString(title, "")
 		}
@@ -266,7 +265,7 @@ func getKhdiamondStream(pageURL string) (string, string, string, error) {
 
 	matches := postIDRegex.FindStringSubmatch(html)
 	if matches == nil {
-		return "", "", "", errPageNotAvailable
+		return "", "", "", fmt.Errorf("no post ID found on page")
 	}
 	postID := matches[1]
 
@@ -276,32 +275,14 @@ func getKhdiamondStream(pageURL string) (string, string, string, error) {
 	form.Set("nume", "1")
 	form.Set("type", mediaType)
 
-	req, err := http.NewRequest("POST", ajaxEndpoint, strings.NewReader(form.Encode()))
+	ajaxResp, err := doRequest("POST", ajaxEndpoint, pageURL, strings.NewReader(form.Encode()))
 	if err != nil {
 		return "", "", "", err
-	}
-	for k, v := range defaultHeaders {
-		req.Header.Set(k, v)
-	}
-	req.Header.Set("Referer", pageURL)
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return "", "", "", err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return "", "", "", fmt.Errorf("ajax request failed (%d)", resp.StatusCode)
 	}
 
 	var result embedResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err := json.Unmarshal([]byte(ajaxResp), &result); err != nil {
 		return "", "", "", fmt.Errorf("failed to parse response: %w", err)
-	}
-	if result.EmbedURL == "" {
-		return "", "", "", fmt.Errorf("no embed_url in response")
 	}
 
 	if strings.Contains(result.EmbedURL, "/error/") || result.Type == false {
@@ -314,27 +295,7 @@ func getKhdiamondStream(pageURL string) (string, string, string, error) {
 	return result.EmbedURL, nextURL, displayTitle, nil
 }
 
-func resolvePageURL(href string) string {
-	parsed, err := url.Parse(strings.TrimSpace(href))
-	if err != nil {
-		return href
-	}
-	if parsed.IsAbs() {
-		return parsed.String()
-	}
-	base, err := url.Parse(baseReferer)
-	if err != nil {
-		return href
-	}
-	return base.ResolveReference(parsed).String()
-}
-
-func userErrorMessage(err error) string {
-	if errors.Is(err, errPageNotAvailable) {
-		return "This episode is not available."
-	}
-	return fmt.Sprintf("Error: %s", err.Error())
-}
+// ── Bot ────────────────────────────────────────────────────────────────────
 
 func getUsername(from *tgbotapi.User) string {
 	if from == nil {
@@ -343,23 +304,11 @@ func getUsername(from *tgbotapi.User) string {
 	if from.UserName != "" {
 		return from.UserName
 	}
-	if from.FirstName != "" {
-		return from.FirstName
-	}
-	return "unknown"
-}
-
-func isKhdiamondURL(rawURL string) bool {
-	parsed, err := url.Parse(rawURL)
-	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
-		return false
-	}
-	host := strings.ToLower(parsed.Hostname())
-	return host == "khdiamond.net" || strings.HasSuffix(host, ".khdiamond.net")
+	return from.FirstName
 }
 
 func main() {
-	_ = godotenv.Load()
+	stats := initDB()
 
 	token := os.Getenv("BOT_TOKEN")
 	if token == "" {
@@ -370,9 +319,6 @@ func main() {
 	if err != nil {
 		log.Fatal("Failed to create bot:", err)
 	}
-
-	stats := initDB()
-	defer stats.db.Close()
 
 	log.Printf("Bot running as @%s", bot.Self.UserName)
 
@@ -387,7 +333,12 @@ func main() {
 
 func handleUpdate(bot *tgbotapi.BotAPI, update tgbotapi.Update, stats *Stats) {
 	if update.CallbackQuery != nil {
-		handleCallback(bot, update.CallbackQuery, stats)
+		data := update.CallbackQuery.Data
+		if data == "refresh" {
+			handleRefresh(bot, update.CallbackQuery, stats)
+		} else if data == "next" {
+			handleNext(bot, update.CallbackQuery, stats)
+		}
 		return
 	}
 
@@ -398,15 +349,18 @@ func handleUpdate(bot *tgbotapi.BotAPI, update tgbotapi.Update, stats *Stats) {
 	msg := update.Message
 	chatID := msg.Chat.ID
 	text := strings.TrimSpace(msg.Text)
+	username := getUsername(msg.From)
+
 	if text == "" {
 		return
 	}
 
-	switch text {
-	case "/start":
+	if text == "/start" {
 		send(bot, chatID, "Send me a khdiamond.net URL and I will get the stream for you.")
 		return
-	case "/count_process":
+	}
+
+	if text == "/count_process" {
 		send(bot, chatID, stats.report())
 		return
 	}
@@ -414,47 +368,58 @@ func handleUpdate(bot *tgbotapi.BotAPI, update tgbotapi.Update, stats *Stats) {
 	if strings.HasPrefix(text, "/") {
 		return
 	}
-	if !isKhdiamondURL(text) {
-		send(bot, chatID, "Please send a valid khdiamond.net URL.")
+
+	if !strings.HasPrefix(text, "http") {
+		send(bot, chatID, "Please send a valid URL.")
+		return
+	}
+	if !strings.Contains(text, "khdiamond.net") {
+		send(bot, chatID, "Only khdiamond.net URLs are supported.")
 		return
 	}
 
-	go processRequest(bot, chatID, text, getUsername(msg.From), stats)
+	processRequest(bot, chatID, text, username, stats)
 }
 
-func handleCallback(bot *tgbotapi.BotAPI, query *tgbotapi.CallbackQuery, stats *Stats) {
-	if query.Message == nil {
-		return
-	}
-
+func handleRefresh(bot *tgbotapi.BotAPI, query *tgbotapi.CallbackQuery, stats *Stats) {
 	chatID := query.Message.Chat.ID
 	username := getUsername(query.From)
-	bot.Request(tgbotapi.NewCallback(query.ID, ""))
+	bot.Request(tgbotapi.NewCallback(query.ID, "Refreshing link..."))
 
-	lastURL, nextURL, _, err := stats.getLastInfo(chatID)
-	if err != nil {
-		send(bot, chatID, "Please send a khdiamond.net URL first.")
+	lastURL, _, lastMsgID, err := stats.getLastInfo(chatID)
+	if err != nil || lastURL == "" {
+		send(bot, chatID, "No previous link found to refresh.")
 		return
 	}
 
-	switch query.Data {
-	case "refresh":
-		if lastURL == "" {
-			send(bot, chatID, "Please send a khdiamond.net URL first.")
-			return
-		}
-		go processRequest(bot, chatID, lastURL, username, stats)
-	case "next":
-		if nextURL == "" {
-			send(bot, chatID, "No next episode found for this page.")
-			return
-		}
-		go processRequest(bot, chatID, nextURL, username, stats)
+	if lastMsgID != 0 {
+		edit := tgbotapi.NewEditMessageReplyMarkup(chatID, lastMsgID, tgbotapi.InlineKeyboardMarkup{InlineKeyboard: [][]tgbotapi.InlineKeyboardButton{}})
+		bot.Send(edit)
 	}
+
+	processRequest(bot, chatID, lastURL, username, stats)
+}
+
+func handleNext(bot *tgbotapi.BotAPI, query *tgbotapi.CallbackQuery, stats *Stats) {
+	chatID := query.Message.Chat.ID
+	username := getUsername(query.From)
+	bot.Request(tgbotapi.NewCallback(query.ID, "Loading next episode..."))
+
+	_, nextURL, lastMsgID, err := stats.getLastInfo(chatID)
+	if err != nil || nextURL == "" {
+		send(bot, chatID, "No next episode found.")
+		return
+	}
+
+	if lastMsgID != 0 {
+		edit := tgbotapi.NewEditMessageReplyMarkup(chatID, lastMsgID, tgbotapi.InlineKeyboardMarkup{InlineKeyboard: [][]tgbotapi.InlineKeyboardButton{}})
+		bot.Send(edit)
+	}
+
+	processRequest(bot, chatID, nextURL, username, stats)
 }
 
 func processRequest(bot *tgbotapi.BotAPI, chatID int64, pageURL string, username string, stats *Stats) {
-	// Remove old buttons
 	_, _, oldMsgID, _ := stats.getLastInfo(chatID)
 	if oldMsgID != 0 {
 		edit := tgbotapi.NewEditMessageReplyMarkup(chatID, oldMsgID, tgbotapi.InlineKeyboardMarkup{InlineKeyboard: [][]tgbotapi.InlineKeyboardButton{}})
@@ -467,10 +432,9 @@ func processRequest(bot *tgbotapi.BotAPI, chatID int64, pageURL string, username
 	embedURL, nextURL, displayTitle, err := getKhdiamondStream(pageURL)
 
 	if err != nil {
-		send(bot, chatID, userErrorMessage(err))
+		send(bot, chatID, fmt.Sprintf("Error: %s", err.Error()))
 	} else {
 		stats.updateNextURL(chatID, nextURL)
-
 		msgText := fmt.Sprintf("%s\n\nEmbed URL:\n%s", displayTitle, embedURL)
 		msg := tgbotapi.NewMessage(chatID, msgText)
 
