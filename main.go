@@ -148,8 +148,10 @@ func (s *Stats) report() string {
 
 func doRequest(method, targetURL, referer string, bodyStr string) (string, error) {
 	args := []string{
-		"-s", // silent
-		"-k", // insecure
+		"-s",           // silent
+		"-L",           // follow redirects (important!)
+		"-k",           // insecure
+		"--compressed", // handle gzip/deflate automatically
 		"-X", method,
 		"-H", "User-Agent: " + userAgent,
 	}
@@ -247,6 +249,15 @@ func getKhdiamondStream(pageURL string) (string, string, string, error) {
 
 	matches := postIDRegex.FindStringSubmatch(html)
 	if matches == nil {
+		snippet := html
+		if len(snippet) > 300 {
+			snippet = snippet[:300]
+		}
+		log.Printf("DEBUG: Regex failed. HTML starts with: %s", snippet)
+
+		if strings.Contains(html, "cf-challenge") || strings.Contains(html, "Checking your browser") {
+			return "", "", "", fmt.Errorf("Cloudflare challenge detected. Please try again later or use a proxy")
+		}
 		return "", "", "", fmt.Errorf("no post ID found on page")
 	}
 	postID := matches[1]
