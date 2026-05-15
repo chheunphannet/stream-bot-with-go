@@ -1,15 +1,14 @@
 package main
 
 import (
-	"crypto/tls"
+	"bytes"
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
-	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"regexp"
 	"strings"
 	"time"
@@ -147,48 +146,41 @@ func (s *Stats) report() string {
 
 // ── HTTP Client (Matching Laravel settings) ────────────────────────────────
 
-var httpClient = &http.Client{
-	Timeout: 30 * time.Second,
-	Transport: &http.Transport{
-		// Force HTTP/1.1 as Cloudflare is more lenient with it
-		ForceAttemptHTTP2: false,
-		// Match Laravel's withoutVerifying()
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-	},
-}
-
-func doRequest(method, targetURL, referer string, body io.Reader) (string, error) {
-	req, err := http.NewRequest(method, targetURL, body)
-	if err != nil {
-		return "", err
+func doRequest(method, targetURL, referer string, bodyStr string) (string, error) {
+	args := []string{
+		"-s", // silent
+		"-k", // insecure
+		"-X", method,
+		"-H", "User-Agent: " + userAgent,
 	}
 
-	// Simple headers, exactly like your PHP StreamService.php
-	req.Header.Set("User-Agent", userAgent)
 	if referer != "" {
-		req.Header.Set("Referer", referer)
+		args = append(args, "-H", "Referer: "+referer)
 	}
+
 	if method == "POST" {
-		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		args = append(args, "-H", "Content-Type: application/x-www-form-urlencoded")
+		args = append(args, "-d", bodyStr)
 	}
 
-	resp, err := httpClient.Do(req)
+	args = append(args, targetURL)
+
+	cmd := exec.Command("curl", args...)
+	var out bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
 	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		// Log the error for debugging
-		return "", fmt.Errorf("failed to fetch %s (%d)", targetURL, resp.StatusCode)
+		return "", fmt.Errorf("curl error: %v, stderr: %s", err, stderr.String())
 	}
 
-	data, err := io.ReadAll(resp.Body)
-	return string(data), err
+	return out.String(), nil
 }
 
 func fetchHTML(pageURL, referer string) (string, error) {
-	return doRequest("GET", pageURL, referer, nil)
+	return doRequest("GET", pageURL, referer, "")
 }
 
 var (
@@ -266,7 +258,7 @@ func getKhdiamondStream(pageURL string) (string, string, string, error) {
 	form.Set("type", mediaType)
 
 	// In Laravel, the pageURL is used as referer for the AJAX call
-	ajaxResp, err := doRequest("POST", ajaxEndpoint, pageURL, strings.NewReader(form.Encode()))
+	ajaxResp, err := doRequest("POST", ajaxEndpoint, pageURL, form.Encode())
 	if err != nil {
 		return "", "", "", err
 	}
