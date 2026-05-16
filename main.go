@@ -184,15 +184,6 @@ func doRequestViaSolverr(method, targetURL, referer string, bodyStr string) (str
 		payload["postData"] = bodyStr
 	}
 
-	// Add headers if provided
-	headers := map[string]string{
-		"User-Agent": userAgent,
-	}
-	if referer != "" {
-		headers["Referer"] = referer
-	}
-	payload["headers"] = headers
-
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return "", err
@@ -247,33 +238,13 @@ func bodySnippet(body string, limit int) string {
 	return body
 }
 
-func isCloudflareBlock(html string) bool {
-	lower := strings.ToLower(html)
-	markers := []string{
-		"just a moment...",
-		"cf-challenge",
-		"cf-error-code",
-		"cloudflare ray id",
-		"attention required! | cloudflare",
-		"/cdn-cgi/challenge-platform/",
-	}
-
-	for _, marker := range markers {
-		if strings.Contains(lower, marker) {
-			return true
-		}
-	}
-
-	return false
-}
-
 func sourceAccessError(err error) error {
 	var statusErr *httpStatusError
 	if !errors.As(err, &statusErr) {
 		return nil
 	}
 
-	if statusErr.StatusCode == 403 || isCloudflareBlock(statusErr.Body) {
+	if statusErr.StatusCode == 403 {
 		log.Printf("DEBUG: Source access denied. Status=%d Body=%s", statusErr.StatusCode, bodySnippet(statusErr.Body, 300))
 		return fmt.Errorf("source site returned HTTP %d. Ensure FlareSolverr is running and check its logs for blocks or captcha challenges", statusErr.StatusCode)
 	}
@@ -303,12 +274,6 @@ func getKhdiamondStream(pageURL string) (string, string, string, error) {
 			return "", "", "", accessErr
 		}
 		return "", "", "", err
-	}
-
-	// Cloudflare detection
-	if isCloudflareBlock(html) {
-		log.Printf("DEBUG: Blocked by Cloudflare. Received: %s", bodySnippet(html, 300))
-		return "", "", "", fmt.Errorf("Cloudflare challenge detected. This VPS IP might be flagged")
 	}
 
 	mediaType := "movie"
