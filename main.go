@@ -275,7 +275,7 @@ func sourceAccessError(err error) error {
 
 	if statusErr.StatusCode == 403 || isCloudflareBlock(statusErr.Body) {
 		log.Printf("DEBUG: Source access denied. Status=%d Body=%s", statusErr.StatusCode, bodySnippet(statusErr.Body, 300))
-		return fmt.Errorf("source site returned HTTP %d for this server. If you are authorized to access it, set KH_COOKIE_FILE to a valid cookie jar or ask the site owner to allowlist this server IP", statusErr.StatusCode)
+		return fmt.Errorf("source site returned HTTP %d. Ensure FlareSolverr is running and check its logs for blocks or captcha challenges", statusErr.StatusCode)
 	}
 
 	return nil
