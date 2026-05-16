@@ -10,8 +10,11 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"regexp"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	_ "github.com/glebarez/go-sqlite"
@@ -146,6 +149,69 @@ func (s *Stats) report() string {
 
 // ── HTTP Client (cURL Wrapper - Minimalist Laravel Style) ──────────────────
 
+// ── HTTP Client (Hybrid: FlareSolverr + curl Cache) ──────────────────
+
+var (
+	cookieCache    string
+	uaCache        string
+	cookieExpiry   time.Time
+	cookieMutex    sync.Mutex
+	lastCookies    []map[string]any
+)
+
+func getCFClearance() (string, string, error) {
+	cookieMutex.Lock()
+	defer cookieMutex.Unlock()
+
+	// Reuse if valid (cf_clearance usually lasts 30m-24h, we use 25m safety margin)
+	if time.Now().Before(cookieExpiry) && cookieCache != "" && uaCache != "" {
+		return cookieCache, uaCache, nil
+	}
+
+	log.Println("Refreshing Cloudflare clearance via FlareSolverr...")
+	solverrURL := os.Getenv("FLARESOLVERR_URL")
+	if solverrURL == "" {
+		solverrURL = "http://localhost:8191/v1"
+	}
+
+	payload := map[string]any{
+		"cmd":        "request.get",
+		"url":        "https://khdiamond.net",
+		"maxTimeout": 60000,
+	}
+	body, _ := json.Marshal(payload)
+	resp, err := http.Post(solverrURL, "application/json", bytes.NewReader(body))
+	if err != nil {
+		return "", "", err
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		Solution struct {
+			Cookies []struct {
+				Name  string `json:"name"`
+				Value string `json:"value"`
+			} `json:"cookies"`
+			UserAgent string `json:"userAgent"`
+		} `json:"solution"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", "", err
+	}
+
+	var cookies []string
+	for _, c := range result.Solution.Cookies {
+		cookies = append(cookies, fmt.Sprintf("%s=%s", c.Name, c.Value))
+	}
+
+	cookieCache = strings.Join(cookies, "; ")
+	uaCache = result.Solution.UserAgent
+	cookieExpiry = time.Now().Add(25 * time.Minute)
+
+	log.Printf("Clearance obtained. UA: %s", uaCache)
+	return cookieCache, uaCache, nil
+}
+
 type httpStatusError struct {
 	StatusCode int
 	URL        string
@@ -159,11 +225,80 @@ func (e *httpStatusError) Error() string {
 	return fmt.Sprintf("HTTP %d from %s", e.StatusCode, e.URL)
 }
 
-func doRequest(method, targetURL, referer string, bodyStr string) (string, error) {
-	return doRequestViaSolverr(method, targetURL, referer, bodyStr)
+func splitCurlOutput(raw, marker string) (string, int, error) {
+	idx := strings.LastIndex(raw, marker)
+	if idx == -1 {
+		return raw, 0, fmt.Errorf("curl response missing HTTP status marker")
+	}
+
+	statusText := strings.TrimSpace(raw[idx+len(marker):])
+	statusCode, err := strconv.Atoi(statusText)
+	if err != nil {
+		return raw[:idx], 0, fmt.Errorf("invalid curl HTTP status %q: %w", statusText, err)
+	}
+
+	return raw[:idx], statusCode, nil
 }
 
-var lastCookies []map[string]any
+func doRequest(method, targetURL, referer string, bodyStr string) (string, error) {
+	cookies, ua, err := getCFClearance()
+	if err != nil {
+		return "", err
+	}
+
+	const statusMarker = "\n__STREAM_BOT_HTTP_STATUS__:"
+	args := []string{
+		"-sS", "-L", "-k", "--compressed",
+		"-X", method,
+		"-H", "User-Agent: " + ua,
+		"-H", "Cookie: " + cookies,
+	}
+
+	if referer != "" {
+		args = append(args, "-H", "Referer: "+referer)
+	}
+
+	if method == "POST" {
+		args = append(args, "-H", "Content-Type: application/x-www-form-urlencoded")
+		args = append(args, "-d", bodyStr)
+	}
+
+	args = append(args, "-w", statusMarker+"%{http_code}")
+	args = append(args, targetURL)
+
+	cmd := exec.Command("curl", args...)
+	var out bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &stderr
+
+	err = cmd.Run()
+	body, statusCode, statusErr := splitCurlOutput(out.String(), statusMarker)
+	if statusErr != nil && err == nil {
+		return body, statusErr
+	}
+
+	if err != nil {
+		return body, fmt.Errorf("curl error: %v, stderr: %s", err, stderr.String())
+	}
+
+	if statusCode == 403 {
+		// Cache might be stale, clear it for next time
+		cookieMutex.Lock()
+		cookieCache = ""
+		cookieMutex.Unlock()
+	}
+
+	if statusCode >= 400 {
+		return body, &httpStatusError{
+			StatusCode: statusCode,
+			URL:        targetURL,
+			Body:       body,
+		}
+	}
+
+	return body, nil
+}
 
 func doRequestViaSolverr(method, targetURL, referer string, bodyStr string) (string, error) {
 	solverrURL := os.Getenv("FLARESOLVERR_URL")
