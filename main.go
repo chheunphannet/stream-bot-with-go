@@ -149,163 +149,80 @@ func (s *Stats) report() string {
 
 // ── HTTP Client (cURL Wrapper - Minimalist Laravel Style) ──────────────────
 
-// ── HTTP Client (Hybrid: FlareSolverr + curl Cache) ──────────────────
+// ── HTTP Client (FlareSolverr Session) ────────────────────────────────────
 
 var (
-	cookieCache    string
-	uaCache        string
-	cookieExpiry   time.Time
-	cookieMutex    sync.Mutex
-	lastCookies    []map[string]any
+	solverrSession string
+	sessionMutex   sync.Mutex
 )
 
-func getCFClearance() (string, string, error) {
-	cookieMutex.Lock()
-	defer cookieMutex.Unlock()
+func getSolverrSession() (string, error) {
+	sessionMutex.Lock()
+	defer sessionMutex.Unlock()
 
-	// Reuse if valid (cf_clearance usually lasts 30m-24h, we use 25m safety margin)
-	if time.Now().Before(cookieExpiry) && cookieCache != "" && uaCache != "" {
-		return cookieCache, uaCache, nil
+	if solverrSession != "" {
+		return solverrSession, nil
 	}
 
-	log.Println("Refreshing Cloudflare clearance via FlareSolverr...")
 	solverrURL := os.Getenv("FLARESOLVERR_URL")
 	if solverrURL == "" {
 		solverrURL = "http://localhost:8191/v1"
 	}
 
 	payload := map[string]any{
-		"cmd":        "request.get",
-		"url":        "https://khdiamond.net",
-		"maxTimeout": 60000,
+		"cmd": "sessions.create",
 	}
 	body, _ := json.Marshal(payload)
 	resp, err := http.Post(solverrURL, "application/json", bytes.NewReader(body))
 	if err != nil {
-		return "", "", err
+		return "", err
 	}
 	defer resp.Body.Close()
 
 	var result struct {
-		Solution struct {
-			Cookies []struct {
-				Name  string `json:"name"`
-				Value string `json:"value"`
-			} `json:"cookies"`
-			UserAgent string `json:"userAgent"`
-		} `json:"solution"`
+		Session string `json:"session"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", "", err
-	}
-
-	var cookies []string
-	for _, c := range result.Solution.Cookies {
-		cookies = append(cookies, fmt.Sprintf("%s=%s", c.Name, c.Value))
-	}
-
-	cookieCache = strings.Join(cookies, "; ")
-	uaCache = result.Solution.UserAgent
-	cookieExpiry = time.Now().Add(25 * time.Minute)
-
-	log.Printf("Clearance obtained. UA: %s", uaCache)
-	return cookieCache, uaCache, nil
-}
-
-type httpStatusError struct {
-	StatusCode int
-	URL        string
-	Body       string
-}
-
-func (e *httpStatusError) Error() string {
-	if e.StatusCode == 403 {
-		return fmt.Sprintf("HTTP 403 Forbidden from %s. The source site denied this server request", e.URL)
-	}
-	return fmt.Sprintf("HTTP %d from %s", e.StatusCode, e.URL)
-}
-
-func splitCurlOutput(raw, marker string) (string, int, error) {
-	idx := strings.LastIndex(raw, marker)
-	if idx == -1 {
-		return raw, 0, fmt.Errorf("curl response missing HTTP status marker")
-	}
-
-	statusText := strings.TrimSpace(raw[idx+len(marker):])
-	statusCode, err := strconv.Atoi(statusText)
-	if err != nil {
-		return raw[:idx], 0, fmt.Errorf("invalid curl HTTP status %q: %w", statusText, err)
-	}
-
-	return raw[:idx], statusCode, nil
-}
-
-func doRequest(method, targetURL, referer string, bodyStr string) (string, error) {
-	cookies, ua, _ := getCFClearance()
-
-	// 1. Try with curl + cache first (FAST)
-	if cookies != "" {
-		const statusMarker = "\n__STREAM_BOT_HTTP_STATUS__:"
-		args := []string{
-			"-sS", "-L", "-k", "--compressed", "--http2",
-			"-X", method,
-			"-H", "User-Agent: " + ua,
-			"-H", "Cookie: " + cookies,
-			"-H", "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-			"-H", "Accept-Language: en-US,en;q=0.9",
-			"-H", "Sec-Ch-Ua: \"Not A(Brand\";v=\"99\", \"Google Chrome\";v=\"121\", \"Chromium\";v=\"121\"",
-			"-H", "Sec-Ch-Ua-Mobile: ?0",
-			"-H", "Sec-Ch-Ua-Platform: \"Windows\"",
-			"-H", "Sec-Fetch-Dest: document",
-			"-H", "Sec-Fetch-Mode: navigate",
-			"-H", "Sec-Fetch-Site: none",
-			"-H", "Sec-Fetch-User: ?1",
-			"-H", "Upgrade-Insecure-Requests: 1",
-		}
-
-		if referer != "" {
-			args = append(args, "-H", "Referer: "+referer)
-		}
-
-		if method == "POST" {
-			args = append(args, "-H", "Content-Type: application/x-www-form-urlencoded")
-			args = append(args, "-H", "X-Requested-With: XMLHttpRequest")
-			args = append(args, "-d", bodyStr)
-		}
-
-		args = append(args, "-w", statusMarker+"%{http_code}")
-		args = append(args, targetURL)
-
-		cmd := exec.Command("curl", args...)
-		var out bytes.Buffer
-		cmd.Stdout = &out
-		err := cmd.Run()
-
-		if err == nil {
-			body, statusCode, statusErr := splitCurlOutput(out.String(), statusMarker)
-			if statusErr == nil && statusCode < 400 {
-				return body, nil
-			}
-			log.Printf("Curl failed (Status: %d). Falling back to FlareSolverr...", statusCode)
-		}
-	}
-
-	// 2. Fallback to FlareSolverr (RELIABLE but SLOW)
-	if cookies == "" {
-		log.Printf("No cache available. Using FlareSolverr for: %s", targetURL)
-	}
-	body, err := doRequestViaSolverr(method, targetURL, referer, bodyStr)
-	if err != nil {
 		return "", err
 	}
 
-	return body, nil
+	solverrSession = result.Session
+	log.Printf("FlareSolverr session created: %s", solverrSession)
+	return solverrSession, nil
 }
 
-func doRequestViaSolverr(method, targetURL, referer string, bodyStr string) (string, error) {
+func destroySession() {
+	sessionMutex.Lock()
+	defer sessionMutex.Unlock()
+
+	if solverrSession == "" {
+		return
+	}
+
 	solverrURL := os.Getenv("FLARESOLVERR_URL")
 	if solverrURL == "" {
 		solverrURL = "http://localhost:8191/v1"
+	}
+
+	payload := map[string]any{
+		"cmd":     "sessions.destroy",
+		"session": solverrSession,
+	}
+	body, _ := json.Marshal(payload)
+	http.Post(solverrURL, "application/json", bytes.NewReader(body))
+	solverrSession = ""
+	log.Println("FlareSolverr session destroyed")
+}
+
+func doRequest(method, targetURL, referer, bodyStr string) (string, error) {
+	solverrURL := os.Getenv("FLARESOLVERR_URL")
+	if solverrURL == "" {
+		solverrURL = "http://localhost:8191/v1"
+	}
+
+	session, err := getSolverrSession()
+	if err != nil {
+		return "", fmt.Errorf("failed to get FlareSolverr session: %w", err)
 	}
 
 	cmd := "request.get"
@@ -316,23 +233,19 @@ func doRequestViaSolverr(method, targetURL, referer string, bodyStr string) (str
 	payload := map[string]any{
 		"cmd":        cmd,
 		"url":        targetURL,
-		"maxTimeout": 60000,
+		"session":    session, // reuse same Chrome browser session = fast!
+		"maxTimeout": 30000,
 	}
 
 	if method == "POST" {
 		payload["postData"] = bodyStr
-		if len(lastCookies) > 0 {
-			payload["cookies"] = lastCookies
-		}
 	}
 
-	body, err := json.Marshal(payload)
-	if err != nil {
-		return "", err
-	}
-
+	body, _ := json.Marshal(payload)
 	resp, err := http.Post(solverrURL, "application/json", bytes.NewReader(body))
 	if err != nil {
+		// Session might be dead, reset it
+		destroySession()
 		return "", err
 	}
 	defer resp.Body.Close()
@@ -341,10 +254,8 @@ func doRequestViaSolverr(method, targetURL, referer string, bodyStr string) (str
 		Status   string `json:"status"`
 		Message  string `json:"message"`
 		Solution struct {
-			Response  string           `json:"response"`
-			Status    int              `json:"status"`
-			Cookies   []map[string]any `json:"cookies"`
-			UserAgent string           `json:"userAgent"`
+			Response string `json:"response"`
+			Status   int    `json:"status"`
 		} `json:"solution"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
@@ -352,26 +263,10 @@ func doRequestViaSolverr(method, targetURL, referer string, bodyStr string) (str
 	}
 
 	if result.Status == "error" {
+		// Session might be expired, reset and retry once
+		log.Printf("FlareSolverr error: %s. Resetting session...", result.Message)
+		destroySession()
 		return "", fmt.Errorf("FlareSolverr error: %s", result.Message)
-	}
-
-	// Update the global cache whenever we use FlareSolverr
-	if len(result.Solution.Cookies) > 0 {
-		lastCookies = result.Solution.Cookies
-
-		cookieMutex.Lock()
-		var cookies []string
-		for _, c := range result.Solution.Cookies {
-			name, _ := c["name"].(string)
-			value, _ := c["value"].(string)
-			if name != "" && value != "" {
-				cookies = append(cookies, fmt.Sprintf("%s=%s", name, value))
-			}
-		}
-		cookieCache = strings.Join(cookies, "; ")
-		uaCache = result.Solution.UserAgent
-		cookieExpiry = time.Now().Add(25 * time.Minute)
-		cookieMutex.Unlock()
 	}
 
 	if result.Solution.Status >= 400 {
