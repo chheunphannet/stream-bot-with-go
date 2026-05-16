@@ -163,6 +163,8 @@ func doRequest(method, targetURL, referer string, bodyStr string) (string, error
 	return doRequestViaSolverr(method, targetURL, referer, bodyStr)
 }
 
+var lastCookies []map[string]any
+
 func doRequestViaSolverr(method, targetURL, referer string, bodyStr string) (string, error) {
 	solverrURL := os.Getenv("FLARESOLVERR_URL")
 	if solverrURL == "" {
@@ -182,6 +184,9 @@ func doRequestViaSolverr(method, targetURL, referer string, bodyStr string) (str
 
 	if method == "POST" {
 		payload["postData"] = bodyStr
+		if len(lastCookies) > 0 {
+			payload["cookies"] = lastCookies
+		}
 	}
 
 	body, err := json.Marshal(payload)
@@ -199,12 +204,9 @@ func doRequestViaSolverr(method, targetURL, referer string, bodyStr string) (str
 		Status   string `json:"status"`
 		Message  string `json:"message"`
 		Solution struct {
-			Response string `json:"response"`
-			Status   int    `json:"status"`
-			Cookies  []struct {
-				Name  string `json:"name"`
-				Value string `json:"value"`
-			} `json:"cookies"`
+			Response string           `json:"response"`
+			Status   int              `json:"status"`
+			Cookies  []map[string]any `json:"cookies"`
 		} `json:"solution"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
@@ -213,6 +215,11 @@ func doRequestViaSolverr(method, targetURL, referer string, bodyStr string) (str
 
 	if result.Status == "error" {
 		return "", fmt.Errorf("FlareSolverr error: %s", result.Message)
+	}
+
+	// Save cookies for next request
+	if len(result.Solution.Cookies) > 0 {
+		lastCookies = result.Solution.Cookies
 	}
 
 	if result.Solution.Status >= 400 {
@@ -340,6 +347,7 @@ func getKhdiamondStream(pageURL string) (string, string, string, error) {
 
 	var result embedResponse
 	if err := json.Unmarshal([]byte(ajaxResp), &result); err != nil {
+		log.Printf("DEBUG: AJAX Error. Received: %s", bodySnippet(ajaxResp, 500))
 		return "", "", "", fmt.Errorf("failed to parse response: %w", err)
 	}
 
