@@ -7,11 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"regexp"
-	"strconv"
 	"strings"
 	"time"
 
@@ -25,8 +24,6 @@ import (
 const (
 	dbFile            = "stats.db"
 	ajaxEndpoint      = "https://khdiamond.net/wp-admin/admin-ajax.php"
-	baseReferer       = "https://khdiamond.net"
-	defaultCookieFile = "cookies.txt"
 )
 
 // EXACT User-Agent from your Laravel StreamService.php
@@ -162,84 +159,84 @@ func (e *httpStatusError) Error() string {
 	return fmt.Sprintf("HTTP %d from %s", e.StatusCode, e.URL)
 }
 
-func cookieJarPath() string {
-	if path := strings.TrimSpace(os.Getenv("KH_COOKIE_FILE")); path != "" {
-		return path
-	}
-	return defaultCookieFile
-}
-
-func splitCurlOutput(raw, marker string) (string, int, error) {
-	idx := strings.LastIndex(raw, marker)
-	if idx == -1 {
-		return raw, 0, fmt.Errorf("curl response missing HTTP status marker")
-	}
-
-	statusText := strings.TrimSpace(raw[idx+len(marker):])
-	statusCode, err := strconv.Atoi(statusText)
-	if err != nil {
-		return raw[:idx], 0, fmt.Errorf("invalid curl HTTP status %q: %w", statusText, err)
-	}
-
-	return raw[:idx], statusCode, nil
-}
-
 func doRequest(method, targetURL, referer string, bodyStr string) (string, error) {
-	const statusMarker = "\n__STREAM_BOT_HTTP_STATUS__:"
-	cookieFile := cookieJarPath()
+	return doRequestViaSolverr(method, targetURL, referer, bodyStr)
+}
 
-	args := []string{
-		"-sS",          // silent, but still show network errors
-		"-L",           // follow redirects
-		"-k",           // insecure
-		"--compressed", // handle gzip/br
-		"-b", cookieFile,
-		"-c", cookieFile,
-		"-X", method,
-		"-H", "User-Agent: " + userAgent,
+func doRequestViaSolverr(method, targetURL, referer string, bodyStr string) (string, error) {
+	solverrURL := os.Getenv("FLARESOLVERR_URL")
+	if solverrURL == "" {
+		solverrURL = "http://localhost:8191/v1"
 	}
 
-	if referer != "" {
-		args = append(args, "-H", "Referer: "+referer)
+	cmd := "request.get"
+	if method == "POST" {
+		cmd = "request.post"
+	}
+
+	payload := map[string]any{
+		"cmd":        cmd,
+		"url":        targetURL,
+		"maxTimeout": 60000,
 	}
 
 	if method == "POST" {
-		args = append(args, "-H", "Content-Type: application/x-www-form-urlencoded")
-		args = append(args, "-d", bodyStr)
+		payload["postData"] = bodyStr
 	}
 
-	args = append(args, "-w", statusMarker+"%{http_code}")
-	args = append(args, targetURL)
-
-	cmd := exec.Command("curl", args...)
-	var out bytes.Buffer
-	var stderr bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = &stderr
-
-	err := cmd.Run()
-	body, statusCode, statusErr := splitCurlOutput(out.String(), statusMarker)
-	if statusErr != nil && err == nil {
-		return body, statusErr
+	// Add headers if provided
+	headers := map[string]string{
+		"User-Agent": userAgent,
 	}
+	if referer != "" {
+		headers["Referer"] = referer
+	}
+	payload["headers"] = headers
 
+	body, err := json.Marshal(payload)
 	if err != nil {
-		return body, fmt.Errorf("curl error: %v, stderr: %s", err, stderr.String())
+		return "", err
 	}
 
-	if statusCode >= 400 {
-		return body, &httpStatusError{
-			StatusCode: statusCode,
+	resp, err := http.Post(solverrURL, "application/json", bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		Status   string `json:"status"`
+		Message  string `json:"message"`
+		Solution struct {
+			Response string `json:"response"`
+			Status   int    `json:"status"`
+			Cookies  []struct {
+				Name  string `json:"name"`
+				Value string `json:"value"`
+			} `json:"cookies"`
+		} `json:"solution"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", err
+	}
+
+	if result.Status == "error" {
+		return "", fmt.Errorf("FlareSolverr error: %s", result.Message)
+	}
+
+	if result.Solution.Status >= 400 {
+		return result.Solution.Response, &httpStatusError{
+			StatusCode: result.Solution.Status,
 			URL:        targetURL,
-			Body:       body,
+			Body:       result.Solution.Response,
 		}
 	}
 
-	return body, nil
+	return result.Solution.Response, nil
 }
 
 func fetchHTML(pageURL, referer string) (string, error) {
-	return doRequest("GET", pageURL, referer, "")
+	return doRequestViaSolverr("GET", pageURL, referer, "")
 }
 
 func bodySnippet(body string, limit int) string {
