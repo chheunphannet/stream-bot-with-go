@@ -345,8 +345,17 @@ func getKhdiamondStream(pageURL string) (string, string, string, error) {
 		return "", "", "", err
 	}
 
+	cleanResp := ajaxResp
+	if strings.Contains(ajaxResp, "<pre>") {
+		start := strings.Index(ajaxResp, "<pre>") + 5
+		end := strings.LastIndex(ajaxResp, "</pre>")
+		if end > start {
+			cleanResp = ajaxResp[start:end]
+		}
+	}
+
 	var result embedResponse
-	if err := json.Unmarshal([]byte(ajaxResp), &result); err != nil {
+	if err := json.Unmarshal([]byte(cleanResp), &result); err != nil {
 		log.Printf("DEBUG: AJAX Error. Received: %s", bodySnippet(ajaxResp, 500))
 		return "", "", "", fmt.Errorf("failed to parse response: %w", err)
 	}
