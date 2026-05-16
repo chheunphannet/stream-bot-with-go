@@ -1,66 +1,39 @@
-#!/usr/bin/env bash
-# Build and install the bot on a Linux VPS with systemd.
+#!/bin/bash
 
-set -euo pipefail
+# Exit on error
+set -e
 
-APP_NAME="stream-bot"
-BOT_DIR="${BOT_DIR:-/opt/stream-bot}"
-SERVICE_USER="${SERVICE_USER:-${SUDO_USER:-$USER}}"
-SERVICE_GROUP="${SERVICE_GROUP:-}"
-SERVICE_FILE="/etc/systemd/system/${APP_NAME}.service"
+echo "🚀 Starting deployment..."
 
-if ! command -v go >/dev/null 2>&1; then
-  echo "Go is not installed. Install Go 1.21 or newer first."
-  exit 1
+# 1. Pull latest code
+echo "📥 Fetching latest code from fix/cloudflare-bypass..."
+git fetch origin
+git reset --hard origin/fix/cloudflare-bypass
+git clean -fd
+
+# 2. Update .env if needed
+if [ ! -f .env ]; then
+    echo "📄 Creating .env from .env.example..."
+    cp .env.example .env
+    echo "⚠️  Please edit .env and add your BOT_TOKEN!"
 fi
 
-if ! id "$SERVICE_USER" >/dev/null 2>&1; then
-  echo "Service user '$SERVICE_USER' does not exist."
-  exit 1
+if ! grep -q "FLARESOLVERR_URL" .env; then
+    echo "🔧 Adding FLARESOLVERR_URL to .env..."
+    echo "FLARESOLVERR_URL=http://localhost:8191/v1" >> .env
 fi
 
-if [ -z "$SERVICE_GROUP" ]; then
-  SERVICE_GROUP="$(id -gn "$SERVICE_USER")"
-fi
+# 3. Clean and Build
+echo "🏗️  Building fresh binary..."
+rm -f stream-bot
+go clean -cache
+go build -o stream-bot main.go
 
-if [ ! -f ".env" ] && [ ! -f "${BOT_DIR}/.env" ]; then
-  echo "Missing .env. Create it from .env.example and set BOT_TOKEN."
-  exit 1
-fi
-
-echo "[1/5] Preparing dependencies..."
-go mod tidy
-
-echo "[2/5] Building ${APP_NAME}..."
-go build -trimpath -ldflags="-s -w" -o "${APP_NAME}" .
-
-echo "[3/5] Installing files to ${BOT_DIR}..."
-sudo install -d -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$BOT_DIR"
-sudo install -m 0755 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "${APP_NAME}" "${BOT_DIR}/${APP_NAME}"
-
-if [ ! -f "${BOT_DIR}/.env" ]; then
-  sudo install -m 0600 -o "$SERVICE_USER" -g "$SERVICE_GROUP" .env "${BOT_DIR}/.env"
-  echo "Copied .env to ${BOT_DIR}/.env"
-fi
-
-if [ -f "stats.db" ] && [ ! -f "${BOT_DIR}/stats.db" ]; then
-  sudo install -m 0644 -o "$SERVICE_USER" -g "$SERVICE_GROUP" stats.db "${BOT_DIR}/stats.db"
-  echo "Copied existing stats.db to ${BOT_DIR}/stats.db"
-fi
-
-sudo chown -R "$SERVICE_USER:$SERVICE_GROUP" "$BOT_DIR"
-
-echo "[4/5] Installing systemd service..."
-tmp_service="$(mktemp)"
-sed "s|^User=.*|User=${SERVICE_USER}|" stream-bot.service > "$tmp_service"
-sudo install -m 0644 "$tmp_service" "$SERVICE_FILE"
-rm -f "$tmp_service"
-
-echo "[5/5] Starting service..."
+# 4. Restart Service
+echo "🔄 Restarting stream-bot service..."
 sudo systemctl daemon-reload
-sudo systemctl enable "$APP_NAME"
-sudo systemctl restart "$APP_NAME"
+sudo systemctl restart stream-bot
 
-echo "Done."
-echo "Status: sudo systemctl status ${APP_NAME}"
-echo "Logs:   sudo journalctl -u ${APP_NAME} -f"
+echo "✅ Deployment successful!"
+echo "📡 Check logs with: journalctl -u stream-bot -f"
+echo "🕵️  Check FlareSolverr with: docker logs -f flaresolverr"
