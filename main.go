@@ -241,60 +241,49 @@ func splitCurlOutput(raw, marker string) (string, int, error) {
 }
 
 func doRequest(method, targetURL, referer string, bodyStr string) (string, error) {
-	cookies, ua, err := getCFClearance()
+	cookies, ua, _ := getCFClearance()
+
+	// 1. Try with curl + cache first (FAST)
+	if cookies != "" {
+		const statusMarker = "\n__STREAM_BOT_HTTP_STATUS__:"
+		args := []string{
+			"-sS", "-L", "-k", "--compressed",
+			"-X", method,
+			"-H", "User-Agent: " + ua,
+			"-H", "Cookie: " + cookies,
+		}
+
+		if referer != "" {
+			args = append(args, "-H", "Referer: "+referer)
+		}
+
+		if method == "POST" {
+			args = append(args, "-H", "Content-Type: application/x-www-form-urlencoded")
+			args = append(args, "-d", bodyStr)
+		}
+
+		args = append(args, "-w", statusMarker+"%{http_code}")
+		args = append(args, targetURL)
+
+		cmd := exec.Command("curl", args...)
+		var out bytes.Buffer
+		cmd.Stdout = &out
+		err := cmd.Run()
+
+		if err == nil {
+			body, statusCode, statusErr := splitCurlOutput(out.String(), statusMarker)
+			if statusErr == nil && statusCode < 400 {
+				return body, nil
+			}
+			// If 403, we fall through to FlareSolverr
+		}
+	}
+
+	// 2. Fallback to FlareSolverr (RELIABLE but SLOW)
+	log.Printf("Curl blocked or no cache. Falling back to FlareSolverr for: %s", targetURL)
+	body, err := doRequestViaSolverr(method, targetURL, referer, bodyStr)
 	if err != nil {
 		return "", err
-	}
-
-	const statusMarker = "\n__STREAM_BOT_HTTP_STATUS__:"
-	args := []string{
-		"-sS", "-L", "-k", "--compressed",
-		"-X", method,
-		"-H", "User-Agent: " + ua,
-		"-H", "Cookie: " + cookies,
-	}
-
-	if referer != "" {
-		args = append(args, "-H", "Referer: "+referer)
-	}
-
-	if method == "POST" {
-		args = append(args, "-H", "Content-Type: application/x-www-form-urlencoded")
-		args = append(args, "-d", bodyStr)
-	}
-
-	args = append(args, "-w", statusMarker+"%{http_code}")
-	args = append(args, targetURL)
-
-	cmd := exec.Command("curl", args...)
-	var out bytes.Buffer
-	var stderr bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = &stderr
-
-	err = cmd.Run()
-	body, statusCode, statusErr := splitCurlOutput(out.String(), statusMarker)
-	if statusErr != nil && err == nil {
-		return body, statusErr
-	}
-
-	if err != nil {
-		return body, fmt.Errorf("curl error: %v, stderr: %s", err, stderr.String())
-	}
-
-	if statusCode == 403 {
-		// Cache might be stale, clear it for next time
-		cookieMutex.Lock()
-		cookieCache = ""
-		cookieMutex.Unlock()
-	}
-
-	if statusCode >= 400 {
-		return body, &httpStatusError{
-			StatusCode: statusCode,
-			URL:        targetURL,
-			Body:       body,
-		}
 	}
 
 	return body, nil
@@ -339,9 +328,10 @@ func doRequestViaSolverr(method, targetURL, referer string, bodyStr string) (str
 		Status   string `json:"status"`
 		Message  string `json:"message"`
 		Solution struct {
-			Response string           `json:"response"`
-			Status   int              `json:"status"`
-			Cookies  []map[string]any `json:"cookies"`
+			Response  string           `json:"response"`
+			Status    int              `json:"status"`
+			Cookies   []map[string]any `json:"cookies"`
+			UserAgent string           `json:"userAgent"`
 		} `json:"solution"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
@@ -352,9 +342,21 @@ func doRequestViaSolverr(method, targetURL, referer string, bodyStr string) (str
 		return "", fmt.Errorf("FlareSolverr error: %s", result.Message)
 	}
 
-	// Save cookies for next request
+	// Update the global cache whenever we use FlareSolverr
 	if len(result.Solution.Cookies) > 0 {
 		lastCookies = result.Solution.Cookies
+
+		cookieMutex.Lock()
+		var cookies []string
+		for _, c := range result.Solution.Cookies {
+			name, _ := c["name"].(string)
+			value, _ := c["value"].(string)
+			cookies = append(cookies, fmt.Sprintf("%s=%s", name, value))
+		}
+		cookieCache = strings.Join(cookies, "; ")
+		uaCache = result.Solution.UserAgent
+		cookieExpiry = time.Now().Add(25 * time.Minute)
+		cookieMutex.Unlock()
 	}
 
 	if result.Solution.Status >= 400 {
