@@ -10,9 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"regexp"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -148,6 +146,19 @@ func (s *Stats) report() string {
 }
 
 // ── HTTP Client (cURL Wrapper - Minimalist Laravel Style) ──────────────────
+
+type httpStatusError struct {
+	StatusCode int
+	URL        string
+	Body       string
+}
+
+func (e *httpStatusError) Error() string {
+	if e.StatusCode == 403 {
+		return fmt.Sprintf("HTTP 403 Forbidden from %s. The source site denied this server request", e.URL)
+	}
+	return fmt.Sprintf("HTTP %d from %s", e.StatusCode, e.URL)
+}
 
 // ── HTTP Client (FlareSolverr Session) ────────────────────────────────────
 
