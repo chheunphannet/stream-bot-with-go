@@ -247,10 +247,20 @@ func doRequest(method, targetURL, referer string, bodyStr string) (string, error
 	if cookies != "" {
 		const statusMarker = "\n__STREAM_BOT_HTTP_STATUS__:"
 		args := []string{
-			"-sS", "-L", "-k", "--compressed",
+			"-sS", "-L", "-k", "--compressed", "--http2",
 			"-X", method,
 			"-H", "User-Agent: " + ua,
 			"-H", "Cookie: " + cookies,
+			"-H", "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+			"-H", "Accept-Language: en-US,en;q=0.9",
+			"-H", "Sec-Ch-Ua: \"Not A(Brand\";v=\"99\", \"Google Chrome\";v=\"121\", \"Chromium\";v=\"121\"",
+			"-H", "Sec-Ch-Ua-Mobile: ?0",
+			"-H", "Sec-Ch-Ua-Platform: \"Windows\"",
+			"-H", "Sec-Fetch-Dest: document",
+			"-H", "Sec-Fetch-Mode: navigate",
+			"-H", "Sec-Fetch-Site: none",
+			"-H", "Sec-Fetch-User: ?1",
+			"-H", "Upgrade-Insecure-Requests: 1",
 		}
 
 		if referer != "" {
@@ -259,6 +269,7 @@ func doRequest(method, targetURL, referer string, bodyStr string) (string, error
 
 		if method == "POST" {
 			args = append(args, "-H", "Content-Type: application/x-www-form-urlencoded")
+			args = append(args, "-H", "X-Requested-With: XMLHttpRequest")
 			args = append(args, "-d", bodyStr)
 		}
 
@@ -275,12 +286,14 @@ func doRequest(method, targetURL, referer string, bodyStr string) (string, error
 			if statusErr == nil && statusCode < 400 {
 				return body, nil
 			}
-			// If 403, we fall through to FlareSolverr
+			log.Printf("Curl failed (Status: %d). Falling back to FlareSolverr...", statusCode)
 		}
 	}
 
 	// 2. Fallback to FlareSolverr (RELIABLE but SLOW)
-	log.Printf("Curl blocked or no cache. Falling back to FlareSolverr for: %s", targetURL)
+	if cookies == "" {
+		log.Printf("No cache available. Using FlareSolverr for: %s", targetURL)
+	}
 	body, err := doRequestViaSolverr(method, targetURL, referer, bodyStr)
 	if err != nil {
 		return "", err
@@ -351,7 +364,9 @@ func doRequestViaSolverr(method, targetURL, referer string, bodyStr string) (str
 		for _, c := range result.Solution.Cookies {
 			name, _ := c["name"].(string)
 			value, _ := c["value"].(string)
-			cookies = append(cookies, fmt.Sprintf("%s=%s", name, value))
+			if name != "" && value != "" {
+				cookies = append(cookies, fmt.Sprintf("%s=%s", name, value))
+			}
 		}
 		cookieCache = strings.Join(cookies, "; ")
 		uaCache = result.Solution.UserAgent
@@ -371,7 +386,7 @@ func doRequestViaSolverr(method, targetURL, referer string, bodyStr string) (str
 }
 
 func fetchHTML(pageURL, referer string) (string, error) {
-	return doRequestViaSolverr("GET", pageURL, referer, "")
+	return doRequest("GET", pageURL, referer, "")
 }
 
 func bodySnippet(body string, limit int) string {
