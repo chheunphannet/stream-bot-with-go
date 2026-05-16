@@ -20,6 +20,7 @@ A Telegram bot written in Go that extracts embed stream URLs from `khdiamond.net
 
    ```env
    BOT_TOKEN=your_telegram_bot_token_here
+   KH_COOKIE_FILE=cookies.txt
    ```
 
 3. Run:
@@ -29,6 +30,8 @@ A Telegram bot written in Go that extracts embed stream URLs from `khdiamond.net
    ```
 
 The bot keeps running until you stop it with `Ctrl+C`.
+
+`KH_COOKIE_FILE` is optional. It points to the curl/Netscape-format cookie jar used for requests to the source site, defaulting to `cookies.txt`.
 
 ## VPS Deployment
 
@@ -72,5 +75,6 @@ sudo journalctl -u stream-bot -f
 - `main.go`: bot source code.
 - `stats.db`: SQLite stats database, created automatically at runtime.
 - `.env`: production token file, not committed.
+- `cookies.txt`: optional curl cookie jar for authorized source-site sessions.
 - `stream-bot.service`: systemd service template.
 - `deploy.sh`: VPS build and install script.

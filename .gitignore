@@ -10,6 +10,7 @@ stream-bot-*
 stats.json
 stats.db
 stats.db-*
+cookies.txt
 
 # Local build/cache/backup files
 .gocache/

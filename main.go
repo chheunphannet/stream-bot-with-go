@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/url"
 	"os"
 	"os/exec"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -21,10 +23,10 @@ import (
 // ── Constants ──────────────────────────────────────────────────────────────
 
 const (
-	dbFile       = "stats.db"
-	ajaxEndpoint = "https://khdiamond.net/wp-admin/admin-ajax.php"
-	baseReferer  = "https://khdiamond.net"
-	cookieFile   = "cookies.txt"
+	dbFile            = "stats.db"
+	ajaxEndpoint      = "https://khdiamond.net/wp-admin/admin-ajax.php"
+	baseReferer       = "https://khdiamond.net"
+	defaultCookieFile = "cookies.txt"
 )
 
 // EXACT User-Agent from your Laravel StreamService.php
@@ -147,9 +149,47 @@ func (s *Stats) report() string {
 
 // ── HTTP Client (cURL Wrapper - Minimalist Laravel Style) ──────────────────
 
+type httpStatusError struct {
+	StatusCode int
+	URL        string
+	Body       string
+}
+
+func (e *httpStatusError) Error() string {
+	if e.StatusCode == 403 {
+		return fmt.Sprintf("HTTP 403 Forbidden from %s. The source site denied this server request", e.URL)
+	}
+	return fmt.Sprintf("HTTP %d from %s", e.StatusCode, e.URL)
+}
+
+func cookieJarPath() string {
+	if path := strings.TrimSpace(os.Getenv("KH_COOKIE_FILE")); path != "" {
+		return path
+	}
+	return defaultCookieFile
+}
+
+func splitCurlOutput(raw, marker string) (string, int, error) {
+	idx := strings.LastIndex(raw, marker)
+	if idx == -1 {
+		return raw, 0, fmt.Errorf("curl response missing HTTP status marker")
+	}
+
+	statusText := strings.TrimSpace(raw[idx+len(marker):])
+	statusCode, err := strconv.Atoi(statusText)
+	if err != nil {
+		return raw[:idx], 0, fmt.Errorf("invalid curl HTTP status %q: %w", statusText, err)
+	}
+
+	return raw[:idx], statusCode, nil
+}
+
 func doRequest(method, targetURL, referer string, bodyStr string) (string, error) {
+	const statusMarker = "\n__STREAM_BOT_HTTP_STATUS__:"
+	cookieFile := cookieJarPath()
+
 	args := []string{
-		"-s",           // silent
+		"-sS",          // silent, but still show network errors
 		"-L",           // follow redirects
 		"-k",           // insecure
 		"--compressed", // handle gzip/br
@@ -168,6 +208,7 @@ func doRequest(method, targetURL, referer string, bodyStr string) (string, error
 		args = append(args, "-d", bodyStr)
 	}
 
+	args = append(args, "-w", statusMarker+"%{http_code}")
 	args = append(args, targetURL)
 
 	cmd := exec.Command("curl", args...)
@@ -177,15 +218,70 @@ func doRequest(method, targetURL, referer string, bodyStr string) (string, error
 	cmd.Stderr = &stderr
 
 	err := cmd.Run()
-	if err != nil {
-		return "", fmt.Errorf("curl error: %v, stderr: %s", err, stderr.String())
+	body, statusCode, statusErr := splitCurlOutput(out.String(), statusMarker)
+	if statusErr != nil && err == nil {
+		return body, statusErr
 	}
 
-	return out.String(), nil
+	if err != nil {
+		return body, fmt.Errorf("curl error: %v, stderr: %s", err, stderr.String())
+	}
+
+	if statusCode >= 400 {
+		return body, &httpStatusError{
+			StatusCode: statusCode,
+			URL:        targetURL,
+			Body:       body,
+		}
+	}
+
+	return body, nil
 }
 
 func fetchHTML(pageURL, referer string) (string, error) {
 	return doRequest("GET", pageURL, referer, "")
+}
+
+func bodySnippet(body string, limit int) string {
+	body = strings.TrimSpace(body)
+	if len(body) > limit {
+		return body[:limit]
+	}
+	return body
+}
+
+func isCloudflareBlock(html string) bool {
+	lower := strings.ToLower(html)
+	markers := []string{
+		"just a moment...",
+		"cf-challenge",
+		"cf-error-code",
+		"cloudflare ray id",
+		"attention required! | cloudflare",
+		"/cdn-cgi/challenge-platform/",
+	}
+
+	for _, marker := range markers {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func sourceAccessError(err error) error {
+	var statusErr *httpStatusError
+	if !errors.As(err, &statusErr) {
+		return nil
+	}
+
+	if statusErr.StatusCode == 403 || isCloudflareBlock(statusErr.Body) {
+		log.Printf("DEBUG: Source access denied. Status=%d Body=%s", statusErr.StatusCode, bodySnippet(statusErr.Body, 300))
+		return fmt.Errorf("source site returned HTTP %d for this server. If you are authorized to access it, set KH_COOKIE_FILE to a valid cookie jar or ask the site owner to allowlist this server IP", statusErr.StatusCode)
+	}
+
+	return nil
 }
 
 var (
@@ -206,16 +302,15 @@ func getKhdiamondStream(pageURL string) (string, string, string, error) {
 	u, _ := url.Parse(pageURL)
 	html, err := fetchHTML(pageURL, fmt.Sprintf("%s://%s", u.Scheme, u.Host))
 	if err != nil {
+		if accessErr := sourceAccessError(err); accessErr != nil {
+			return "", "", "", accessErr
+		}
 		return "", "", "", err
 	}
 
 	// Cloudflare detection
-	if strings.Contains(html, "Just a moment...") || strings.Contains(html, "cf-challenge") {
-		snippet := html
-		if len(snippet) > 300 {
-			snippet = snippet[:300]
-		}
-		log.Printf("DEBUG: Blocked by Cloudflare. Received: %s", snippet)
+	if isCloudflareBlock(html) {
+		log.Printf("DEBUG: Blocked by Cloudflare. Received: %s", bodySnippet(html, 300))
 		return "", "", "", fmt.Errorf("Cloudflare challenge detected. This VPS IP might be flagged")
 	}
 
@@ -275,6 +370,9 @@ func getKhdiamondStream(pageURL string) (string, string, string, error) {
 	// Match Laravel's getEmbedUrl with Referer = pageUrl
 	ajaxResp, err := doRequest("POST", ajaxEndpoint, pageURL, form.Encode())
 	if err != nil {
+		if accessErr := sourceAccessError(err); accessErr != nil {
+			return "", "", "", accessErr
+		}
 		return "", "", "", err
 	}
 
