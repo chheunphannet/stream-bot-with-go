@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"html"
 	"log"
 	"net/url"
 	"os"
@@ -216,25 +217,25 @@ type embedResponse struct {
 
 func getKhdiamondStream(pageURL string) (string, string, string, error) {
 	u, _ := url.Parse(pageURL)
-	html, err := fetchHTML(pageURL, fmt.Sprintf("%s://%s", u.Scheme, u.Host))
+	pageHTML, err := fetchHTML(pageURL, fmt.Sprintf("%s://%s", u.Scheme, u.Host))
 	if err != nil {
 		return "", "", "", err
 	}
 
 	mediaType := "movie"
-	if strings.Contains(html, "single-episodes") || strings.Contains(html, "single-tvshows") || strings.Contains(pageURL, "/episodes/") || strings.Contains(pageURL, "/tvshows/") {
+	if strings.Contains(pageHTML, "single-episodes") || strings.Contains(pageHTML, "single-tvshows") || strings.Contains(pageURL, "/episodes/") || strings.Contains(pageURL, "/tvshows/") {
 		mediaType = "tv"
 	}
 
 	title := "Unknown"
-	titleMatches := titleRegex.FindStringSubmatch(html)
+	titleMatches := titleRegex.FindStringSubmatch(pageHTML)
 	if len(titleMatches) > 1 {
-		title = strings.TrimSpace(titleMatches[1])
+		title = html.UnescapeString(strings.TrimSpace(titleMatches[1]))
 	}
 
 	nextURL := ""
 	if mediaType == "tv" {
-		nextMatches := nextURLRegex.FindStringSubmatch(html)
+		nextMatches := nextURLRegex.FindStringSubmatch(pageHTML)
 		if len(nextMatches) > 1 {
 			nextURL = nextMatches[1]
 		}
@@ -244,7 +245,7 @@ func getKhdiamondStream(pageURL string) (string, string, string, error) {
 	if mediaType == "tv" {
 		numMatches := numRegex.FindStringSubmatch(title)
 		if len(numMatches) == 0 {
-			numMatches = numRegex.FindStringSubmatch(html)
+			numMatches = numRegex.FindStringSubmatch(pageHTML)
 		}
 
 		if len(numMatches) > 0 {
@@ -264,15 +265,15 @@ func getKhdiamondStream(pageURL string) (string, string, string, error) {
 
 	// Try multiple ways to find the Post ID
 	postID := ""
-	if m := postIDRegex.FindStringSubmatch(html); len(m) > 1 {
+	if m := postIDRegex.FindStringSubmatch(pageHTML); len(m) > 1 {
 		postID = m[1]
-	} else if m := shortlinkRegex.FindStringSubmatch(html); len(m) > 1 {
+	} else if m := shortlinkRegex.FindStringSubmatch(pageHTML); len(m) > 1 {
 		postID = m[1]
 	}
 
 	if postID == "" {
 		// Log a snippet of HTML for debugging
-		snippet := html
+		snippet := pageHTML
 		if len(snippet) > 1000 {
 			snippet = snippet[:1000]
 		}
