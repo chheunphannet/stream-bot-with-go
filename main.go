@@ -182,11 +182,12 @@ func fetchHTML(pageURL, referer string) (string, error) {
 // ── Stream Extraction ──────────────────────────────────────────────────────
 
 var (
-	postIDRegex  = regexp.MustCompile(`postid-(\d+)`)
-	nextURLRegex = regexp.MustCompile(`<a href=['"]([^'"]+)['"][^>]*>\s*<span>ភាគបន្ទាប់</span>`)
-	titleRegex   = regexp.MustCompile(`<h1[^>]*>([^<]+)</h1>`)
-	numRegex     = regexp.MustCompile(`(\d+)x(\d+)|S(\d+)\s*-\s*E(\d+)`)
-	cleanupRegex = regexp.MustCompile(`[:\-\s]+$`)
+	postIDRegex    = regexp.MustCompile(`postid-(\d+)`)
+	shortlinkRegex = regexp.MustCompile(`\?p=(\d+)`)
+	nextURLRegex   = regexp.MustCompile(`<a href=['"]([^'"]+)['"][^>]*>\s*<span>ភាគបន្ទាប់</span>`)
+	titleRegex     = regexp.MustCompile(`<h1[^>]*>([^<]+)</h1>`)
+	numRegex       = regexp.MustCompile(`(\d+)x(\d+)|S(\d+)\s*-\s*E(\d+)`)
+	cleanupRegex   = regexp.MustCompile(`[:\-\s]+$`)
 )
 
 type embedResponse struct {
@@ -242,11 +243,23 @@ func getKhdiamondStream(pageURL string) (string, string, string, error) {
 
 	displayTitle := fmt.Sprintf("Title: %s%s", title, metaInfo)
 
-	matches := postIDRegex.FindStringSubmatch(html)
-	if matches == nil {
+	// Try multiple ways to find the Post ID
+	postID := ""
+	if m := postIDRegex.FindStringSubmatch(html); len(m) > 1 {
+		postID = m[1]
+	} else if m := shortlinkRegex.FindStringSubmatch(html); len(m) > 1 {
+		postID = m[1]
+	}
+
+	if postID == "" {
+		// Log a snippet of HTML for debugging
+		snippet := html
+		if len(snippet) > 1000 {
+			snippet = snippet[:1000]
+		}
+		log.Printf("DEBUG: Failed to find post ID. URL: %s HTML Snippet: %s", pageURL, snippet)
 		return "", "", "", fmt.Errorf("no post ID found on page. (Site might have changed structure)")
 	}
-	postID := matches[1]
 
 	form := url.Values{}
 	form.Set("action", "doo_player_ajax")
