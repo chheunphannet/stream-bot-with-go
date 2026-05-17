@@ -4,15 +4,13 @@ import (
 	"bytes"
 	"database/sql"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log"
-	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"regexp"
 	"strings"
-	"sync"
 	"time"
 
 	_ "github.com/glebarez/go-sqlite"
@@ -23,12 +21,9 @@ import (
 // ── Constants ──────────────────────────────────────────────────────────────
 
 const (
-	dbFile            = "stats.db"
-	ajaxEndpoint      = "https://khdiamond.net/wp-admin/admin-ajax.php"
+	dbFile       = "stats.db"
+	ajaxEndpoint = "https://khdiamond.net/wp-admin/admin-ajax.php"
 )
-
-// EXACT User-Agent from your Laravel StreamService.php
-const userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
 
 // ── Database & Stats ───────────────────────────────────────────────────────
 
@@ -145,177 +140,44 @@ func (s *Stats) report() string {
 	)
 }
 
-// ── HTTP Client (cURL Wrapper - Minimalist Laravel Style) ──────────────────
-
-type httpStatusError struct {
-	StatusCode int
-	URL        string
-	Body       string
-}
-
-func (e *httpStatusError) Error() string {
-	if e.StatusCode == 403 {
-		return fmt.Sprintf("HTTP 403 Forbidden from %s. The source site denied this server request", e.URL)
-	}
-	return fmt.Sprintf("HTTP %d from %s", e.StatusCode, e.URL)
-}
-
-// ── HTTP Client (FlareSolverr Session) ────────────────────────────────────
-
-var (
-	solverrSession string
-	sessionMutex   sync.Mutex
-)
-
-func getSolverrSession() (string, error) {
-	sessionMutex.Lock()
-	defer sessionMutex.Unlock()
-
-	if solverrSession != "" {
-		return solverrSession, nil
-	}
-
-	solverrURL := os.Getenv("FLARESOLVERR_URL")
-	if solverrURL == "" {
-		solverrURL = "http://localhost:8191/v1"
-	}
-
-	payload := map[string]any{
-		"cmd": "sessions.create",
-	}
-	body, _ := json.Marshal(payload)
-	resp, err := http.Post(solverrURL, "application/json", bytes.NewReader(body))
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	var result struct {
-		Session string `json:"session"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", err
-	}
-
-	solverrSession = result.Session
-	log.Printf("FlareSolverr session created: %s", solverrSession)
-	return solverrSession, nil
-}
-
-func destroySession() {
-	sessionMutex.Lock()
-	defer sessionMutex.Unlock()
-
-	if solverrSession == "" {
-		return
-	}
-
-	solverrURL := os.Getenv("FLARESOLVERR_URL")
-	if solverrURL == "" {
-		solverrURL = "http://localhost:8191/v1"
-	}
-
-	payload := map[string]any{
-		"cmd":     "sessions.destroy",
-		"session": solverrSession,
-	}
-	body, _ := json.Marshal(payload)
-	http.Post(solverrURL, "application/json", bytes.NewReader(body))
-	solverrSession = ""
-	log.Println("FlareSolverr session destroyed")
-}
+// ── HTTP Client (curl_chrome120 / curl-impersonate) ────────────────────────
 
 func doRequest(method, targetURL, referer, bodyStr string) (string, error) {
-	solverrURL := os.Getenv("FLARESOLVERR_URL")
-	if solverrURL == "" {
-		solverrURL = "http://localhost:8191/v1"
+	args := []string{
+		"-sS", "-L", "-k", "--compressed",
+		"-X", method,
 	}
 
-	session, err := getSolverrSession()
-	if err != nil {
-		return "", fmt.Errorf("failed to get FlareSolverr session: %w", err)
-	}
-
-	cmd := "request.get"
-	if method == "POST" {
-		cmd = "request.post"
-	}
-
-	payload := map[string]any{
-		"cmd":        cmd,
-		"url":        targetURL,
-		"session":    session, // reuse same Chrome browser session = fast!
-		"maxTimeout": 30000,
+	if referer != "" {
+		args = append(args, "-H", "Referer: "+referer)
 	}
 
 	if method == "POST" {
-		payload["postData"] = bodyStr
+		args = append(args, "-H", "Content-Type: application/x-www-form-urlencoded")
+		args = append(args, "-d", bodyStr)
 	}
 
-	body, _ := json.Marshal(payload)
-	resp, err := http.Post(solverrURL, "application/json", bytes.NewReader(body))
+	args = append(args, targetURL)
+
+	cmd := exec.Command("curl_chrome120", args...)
+	var out bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
 	if err != nil {
-		// Session might be dead, reset it
-		destroySession()
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	var result struct {
-		Status   string `json:"status"`
-		Message  string `json:"message"`
-		Solution struct {
-			Response string `json:"response"`
-			Status   int    `json:"status"`
-		} `json:"solution"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", err
+		return "", fmt.Errorf("curl_chrome120 error: %v, stderr: %s", err, stderr.String())
 	}
 
-	if result.Status == "error" {
-		// Session might be expired, reset and retry once
-		log.Printf("FlareSolverr error: %s. Resetting session...", result.Message)
-		destroySession()
-		return "", fmt.Errorf("FlareSolverr error: %s", result.Message)
-	}
-
-	if result.Solution.Status >= 400 {
-		return result.Solution.Response, &httpStatusError{
-			StatusCode: result.Solution.Status,
-			URL:        targetURL,
-			Body:       result.Solution.Response,
-		}
-	}
-
-	return result.Solution.Response, nil
+	return out.String(), nil
 }
 
 func fetchHTML(pageURL, referer string) (string, error) {
 	return doRequest("GET", pageURL, referer, "")
 }
 
-func bodySnippet(body string, limit int) string {
-	body = strings.TrimSpace(body)
-	if len(body) > limit {
-		return body[:limit]
-	}
-	return body
-}
-
-func sourceAccessError(err error) error {
-	var statusErr *httpStatusError
-	if !errors.As(err, &statusErr) {
-		return nil
-	}
-
-	if statusErr.StatusCode == 403 {
-		log.Printf("DEBUG: Source access denied. Status=%d Body=%s", statusErr.StatusCode, bodySnippet(statusErr.Body, 300))
-		return fmt.Errorf("source site returned HTTP %d. Ensure FlareSolverr is running and check its logs for blocks or captcha challenges", statusErr.StatusCode)
-	}
-
-	return nil
-}
+// ── Stream Extraction ──────────────────────────────────────────────────────
 
 var (
 	postIDRegex  = regexp.MustCompile(`postid-(\d+)`)
@@ -331,13 +193,9 @@ type embedResponse struct {
 }
 
 func getKhdiamondStream(pageURL string) (string, string, string, error) {
-	// Match Laravel's fetchHtml($url, "https://$host")
 	u, _ := url.Parse(pageURL)
 	html, err := fetchHTML(pageURL, fmt.Sprintf("%s://%s", u.Scheme, u.Host))
 	if err != nil {
-		if accessErr := sourceAccessError(err); accessErr != nil {
-			return "", "", "", accessErr
-		}
 		return "", "", "", err
 	}
 
@@ -394,12 +252,8 @@ func getKhdiamondStream(pageURL string) (string, string, string, error) {
 	form.Set("nume", "1")
 	form.Set("type", mediaType)
 
-	// Match Laravel's getEmbedUrl with Referer = pageUrl
 	ajaxResp, err := doRequest("POST", ajaxEndpoint, pageURL, form.Encode())
 	if err != nil {
-		if accessErr := sourceAccessError(err); accessErr != nil {
-			return "", "", "", accessErr
-		}
 		return "", "", "", err
 	}
 
@@ -414,7 +268,6 @@ func getKhdiamondStream(pageURL string) (string, string, string, error) {
 
 	var result embedResponse
 	if err := json.Unmarshal([]byte(cleanResp), &result); err != nil {
-		log.Printf("DEBUG: AJAX Error. Received: %s", bodySnippet(ajaxResp, 500))
 		return "", "", "", fmt.Errorf("failed to parse response: %w", err)
 	}
 
