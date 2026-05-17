@@ -9,8 +9,10 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
 	"regexp"
 	"strings"
+	"syscall"
 	"time"
 
 	_ "github.com/glebarez/go-sqlite"
@@ -295,6 +297,7 @@ func getUsername(from *tgbotapi.User) string {
 
 func main() {
 	stats := initDB()
+	defer stats.db.Close()
 
 	token := os.Getenv("BOT_TOKEN")
 	if token == "" {
@@ -312,9 +315,19 @@ func main() {
 	u.Timeout = 60
 	updates := bot.GetUpdatesChan(u)
 
-	for update := range updates {
-		go handleUpdate(bot, update, stats)
-	}
+	// Channel to listen for interrupt signals
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+
+	go func() {
+		for update := range updates {
+			go handleUpdate(bot, update, stats)
+		}
+	}()
+
+	// Block until a signal is received
+	sig := <-sigChan
+	log.Printf("Received signal: %v. Shutting down gracefully...", sig)
 }
 
 func handleUpdate(bot *tgbotapi.BotAPI, update tgbotapi.Update, stats *Stats) {

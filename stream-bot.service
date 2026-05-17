@@ -6,16 +6,15 @@ After=network-online.target
 [Service]
 Type=simple
 User=ubuntu
-WorkingDirectory=/opt/stream-bot
-EnvironmentFile=/opt/stream-bot/.env
-ExecStart=/opt/stream-bot/stream-bot
+# Replace /home/ubuntu/stream-bot-with-go with your actual path
+WorkingDirectory=/home/ubuntu/stream-bot-with-go
+EnvironmentFile=/home/ubuntu/stream-bot-with-go/.env
+ExecStart=/home/ubuntu/stream-bot-with-go/stream-bot
 Restart=always
 RestartSec=5
-UMask=0077
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=full
-ReadWritePaths=/opt/stream-bot
+# Ensure logs are visible in journalctl
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
