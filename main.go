@@ -2,8 +2,10 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html"
 	"log"
@@ -12,7 +14,9 @@ import (
 	"os/exec"
 	"os/signal"
 	"regexp"
+	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -24,9 +28,27 @@ import (
 // ── Constants ──────────────────────────────────────────────────────────────
 
 const (
-	dbFile       = "stats.db"
-	ajaxEndpoint = "https://khdiamond.net/wp-admin/admin-ajax.php"
+	dbFile               = "stats.db"
+	ajaxEndpoint         = "https://khdiamond.net/wp-admin/admin-ajax.php"
+	defaultUpdateWorkers = 8
+	defaultFetchWorkers  = 4
+	requestTimeout       = 90 * time.Second
 )
+
+func envInt(key string, fallback int) int {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback
+	}
+
+	n, err := strconv.Atoi(value)
+	if err != nil || n < 1 {
+		log.Printf("Invalid %s=%q; using %d", key, value, fallback)
+		return fallback
+	}
+
+	return n
+}
 
 // ── Database & Stats ───────────────────────────────────────────────────────
 
@@ -42,7 +64,9 @@ func initDB() *Stats {
 		log.Fatal("Failed to open database:", err)
 	}
 
-	db.SetMaxOpenConns(1)
+	dbMaxOpenConns := envInt("DB_MAX_OPEN_CONNS", 4)
+	db.SetMaxOpenConns(dbMaxOpenConns)
+	db.SetMaxIdleConns(dbMaxOpenConns)
 
 	query := `
 	CREATE TABLE IF NOT EXISTS users (
@@ -87,12 +111,16 @@ func (s *Stats) trackUser(chatID int64, username string, pageURL string) {
 
 func (s *Stats) updateLastMessage(chatID int64, msgID int) {
 	query := "UPDATE users SET last_msg_id = ? WHERE id = ?"
-	s.db.Exec(query, msgID, fmt.Sprintf("%d", chatID))
+	if _, err := s.db.Exec(query, msgID, fmt.Sprintf("%d", chatID)); err != nil {
+		log.Println("Database error (updateLastMessage):", err)
+	}
 }
 
 func (s *Stats) updateNextURL(chatID int64, nextURL string) {
 	query := "UPDATE users SET next_url = ? WHERE id = ?"
-	s.db.Exec(query, nextURL, fmt.Sprintf("%d", chatID))
+	if _, err := s.db.Exec(query, nextURL, fmt.Sprintf("%d", chatID)); err != nil {
+		log.Println("Database error (updateNextURL):", err)
+	}
 }
 
 func (s *Stats) getLastInfo(chatID int64) (string, string, int, error) {
@@ -117,7 +145,10 @@ func (s *Stats) getLastInfo(chatID int64) (string, string, int, error) {
 func (s *Stats) report() string {
 	var totalUsers int
 	var totalRequests int
-	_ = s.db.QueryRow("SELECT COUNT(*), SUM(request_count) FROM users").Scan(&totalUsers, &totalRequests)
+	if err := s.db.QueryRow("SELECT COUNT(*), COALESCE(SUM(request_count), 0) FROM users").Scan(&totalUsers, &totalRequests); err != nil {
+		log.Println("Database error (report totals):", err)
+		return "Error generating report"
+	}
 
 	rows, err := s.db.Query("SELECT username, request_count FROM users ORDER BY request_count DESC LIMIT 5")
 	if err != nil {
@@ -130,9 +161,16 @@ func (s *Stats) report() string {
 	for rows.Next() {
 		var uname string
 		var count int
-		rows.Scan(&uname, &count)
+		if err := rows.Scan(&uname, &count); err != nil {
+			log.Println("Database error (report row):", err)
+			continue
+		}
 		lines = append(lines, fmt.Sprintf("%d. @%s — %d requests", i, uname, count))
 		i++
+	}
+	if err := rows.Err(); err != nil {
+		log.Println("Database error (report rows):", err)
+		return "Error generating report"
 	}
 
 	return fmt.Sprintf(
@@ -145,9 +183,11 @@ func (s *Stats) report() string {
 
 // ── HTTP Client (curl_chrome120 / curl-impersonate) ────────────────────────
 
-func doRequest(method, targetURL, referer, bodyStr string) (string, error) {
+func doRequest(ctx context.Context, method, targetURL, referer, bodyStr string) (string, error) {
 	args := []string{
 		"-sS", "-L", "-k", "--compressed",
+		"--connect-timeout", "10",
+		"--max-time", "75",
 		"-X", method,
 		"-H", "Authority: khdiamond.net",
 		"-H", "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
@@ -176,7 +216,7 @@ func doRequest(method, targetURL, referer, bodyStr string) (string, error) {
 
 	args = append(args, targetURL)
 
-	cmd := exec.Command("curl_chrome120", args...)
+	cmd := exec.CommandContext(ctx, "curl_chrome120", args...)
 	var out bytes.Buffer
 	var stderr bytes.Buffer
 	cmd.Stdout = &out
@@ -184,6 +224,9 @@ func doRequest(method, targetURL, referer, bodyStr string) (string, error) {
 
 	err := cmd.Run()
 	if err != nil {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return "", fmt.Errorf("request timed out after %s", requestTimeout)
+		}
 		return "", fmt.Errorf("curl_chrome120 error: %v, stderr: %s", err, stderr.String())
 	}
 
@@ -195,8 +238,8 @@ func doRequest(method, targetURL, referer, bodyStr string) (string, error) {
 	return resp, nil
 }
 
-func fetchHTML(pageURL, referer string) (string, error) {
-	return doRequest("GET", pageURL, referer, "")
+func fetchHTML(ctx context.Context, pageURL, referer string) (string, error) {
+	return doRequest(ctx, "GET", pageURL, referer, "")
 }
 
 // ── Stream Extraction ──────────────────────────────────────────────────────
@@ -215,9 +258,12 @@ type embedResponse struct {
 	Type     any    `json:"type"`
 }
 
-func getKhdiamondStream(pageURL string) (string, string, string, error) {
-	u, _ := url.Parse(pageURL)
-	pageHTML, err := fetchHTML(pageURL, fmt.Sprintf("%s://%s", u.Scheme, u.Host))
+func getKhdiamondStream(ctx context.Context, pageURL string) (string, string, string, error) {
+	u, err := url.Parse(pageURL)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return "", "", "", fmt.Errorf("invalid page URL")
+	}
+	pageHTML, err := fetchHTML(ctx, pageURL, fmt.Sprintf("%s://%s", u.Scheme, u.Host))
 	if err != nil {
 		return "", "", "", err
 	}
@@ -287,7 +333,7 @@ func getKhdiamondStream(pageURL string) (string, string, string, error) {
 	form.Set("nume", "1")
 	form.Set("type", mediaType)
 
-	ajaxResp, err := doRequest("POST", ajaxEndpoint, pageURL, form.Encode())
+	ajaxResp, err := doRequest(ctx, "POST", ajaxEndpoint, pageURL, form.Encode())
 	if err != nil {
 		return "", "", "", err
 	}
@@ -328,6 +374,52 @@ func getUsername(from *tgbotapi.User) string {
 	return from.FirstName
 }
 
+func isKhdiamondURL(rawURL string) bool {
+	parsed, err := url.Parse(rawURL)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return false
+	}
+
+	host := strings.ToLower(parsed.Hostname())
+	return host == "khdiamond.net" || strings.HasSuffix(host, ".khdiamond.net")
+}
+
+type BotServer struct {
+	bot          *tgbotapi.BotAPI
+	stats        *Stats
+	fetchLimiter chan struct{}
+	chatLocks    sync.Map
+}
+
+func newBotServer(bot *tgbotapi.BotAPI, stats *Stats, maxFetches int) *BotServer {
+	return &BotServer{
+		bot:          bot,
+		stats:        stats,
+		fetchLimiter: make(chan struct{}, maxFetches),
+	}
+}
+
+func (s *BotServer) chatLock(chatID int64) *sync.Mutex {
+	lock, _ := s.chatLocks.LoadOrStore(chatID, &sync.Mutex{})
+	return lock.(*sync.Mutex)
+}
+
+func (s *BotServer) withChatLock(chatID int64, fn func()) {
+	lock := s.chatLock(chatID)
+	lock.Lock()
+	defer lock.Unlock()
+	fn()
+}
+
+func (s *BotServer) answerCallback(query *tgbotapi.CallbackQuery, text string) {
+	if query == nil {
+		return
+	}
+	if _, err := s.bot.Request(tgbotapi.NewCallback(query.ID, text)); err != nil {
+		log.Printf("Telegram callback error: %v", err)
+	}
+}
+
 func main() {
 	stats := initDB()
 	defer stats.db.Close()
@@ -348,28 +440,71 @@ func main() {
 	u.Timeout = 60
 	updates := bot.GetUpdatesChan(u)
 
-	// Channel to listen for interrupt signals
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	server := newBotServer(bot, stats, envInt("FETCH_WORKERS", defaultFetchWorkers))
+	updateWorkers := envInt("UPDATE_WORKERS", defaultUpdateWorkers)
+	log.Printf("Worker limits: updates=%d fetches=%d", updateWorkers, cap(server.fetchLimiter))
 
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	var wg sync.WaitGroup
+	for i := 0; i < updateWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case update, ok := <-updates:
+					if !ok {
+						return
+					}
+					server.handleUpdate(update)
+				}
+			}
+		}()
+	}
+
+	<-ctx.Done()
+	log.Println("Shutdown requested. Stopping Telegram updates...")
+	bot.StopReceivingUpdates()
+
+	done := make(chan struct{})
 	go func() {
-		for update := range updates {
-			go handleUpdate(bot, update, stats)
-		}
+		wg.Wait()
+		close(done)
 	}()
 
-	// Block until a signal is received
-	sig := <-sigChan
-	log.Printf("Received signal: %v. Shutting down gracefully...", sig)
+	select {
+	case <-done:
+		log.Println("Shutdown complete.")
+	case <-time.After(15 * time.Second):
+		log.Println("Shutdown timeout reached; exiting with active handlers.")
+	}
 }
 
-func handleUpdate(bot *tgbotapi.BotAPI, update tgbotapi.Update, stats *Stats) {
+func (s *BotServer) handleUpdate(update tgbotapi.Update) {
 	if update.CallbackQuery != nil {
-		data := update.CallbackQuery.Data
-		if data == "refresh" {
-			handleRefresh(bot, update.CallbackQuery, stats)
-		} else if data == "next" {
-			handleNext(bot, update.CallbackQuery, stats)
+		query := update.CallbackQuery
+		if query.Message == nil {
+			s.answerCallback(query, "Message is no longer available.")
+			return
+		}
+
+		switch query.Data {
+		case "refresh":
+			s.answerCallback(query, "Refreshing link...")
+			s.withChatLock(query.Message.Chat.ID, func() {
+				s.handleRefresh(query)
+			})
+		case "next":
+			s.answerCallback(query, "Loading next episode...")
+			s.withChatLock(query.Message.Chat.ID, func() {
+				s.handleNext(query)
+			})
+		default:
+			s.answerCallback(query, "Unknown action.")
 		}
 		return
 	}
@@ -378,7 +513,12 @@ func handleUpdate(bot *tgbotapi.BotAPI, update tgbotapi.Update, stats *Stats) {
 		return
 	}
 
-	msg := update.Message
+	s.withChatLock(update.Message.Chat.ID, func() {
+		s.handleMessage(update.Message)
+	})
+}
+
+func (s *BotServer) handleMessage(msg *tgbotapi.Message) {
 	chatID := msg.Chat.ID
 	text := strings.TrimSpace(msg.Text)
 	username := getUsername(msg.From)
@@ -388,12 +528,12 @@ func handleUpdate(bot *tgbotapi.BotAPI, update tgbotapi.Update, stats *Stats) {
 	}
 
 	if text == "/start" {
-		send(bot, chatID, "Send me a khdiamond.net URL and I will get the stream for you.")
+		send(s.bot, chatID, "Send me a khdiamond.net URL and I will get the stream for you.")
 		return
 	}
 
 	if text == "/count_process" {
-		send(bot, chatID, stats.report())
+		send(s.bot, chatID, s.stats.report())
 		return
 	}
 
@@ -401,72 +541,83 @@ func handleUpdate(bot *tgbotapi.BotAPI, update tgbotapi.Update, stats *Stats) {
 		return
 	}
 
-	if !strings.HasPrefix(text, "http") {
-		send(bot, chatID, "Please send a valid URL.")
+	if !strings.HasPrefix(strings.ToLower(text), "http") {
+		send(s.bot, chatID, "Please send a valid URL.")
 		return
 	}
-	if !strings.Contains(text, "khdiamond.net") {
-		send(bot, chatID, "Only khdiamond.net URLs are supported.")
+	if !isKhdiamondURL(text) {
+		send(s.bot, chatID, "Only khdiamond.net URLs are supported.")
 		return
 	}
 
-	processRequest(bot, chatID, text, username, stats)
+	s.processRequest(chatID, text, username)
 }
 
-func handleRefresh(bot *tgbotapi.BotAPI, query *tgbotapi.CallbackQuery, stats *Stats) {
+func (s *BotServer) handleRefresh(query *tgbotapi.CallbackQuery) {
 	chatID := query.Message.Chat.ID
 	username := getUsername(query.From)
-	bot.Request(tgbotapi.NewCallback(query.ID, "Refreshing link..."))
 
-	lastURL, _, lastMsgID, err := stats.getLastInfo(chatID)
+	lastURL, _, lastMsgID, err := s.stats.getLastInfo(chatID)
 	if err != nil || lastURL == "" {
-		send(bot, chatID, "No previous link found to refresh.")
+		send(s.bot, chatID, "No previous link found to refresh.")
 		return
 	}
 
 	if lastMsgID != 0 {
 		edit := tgbotapi.NewEditMessageReplyMarkup(chatID, lastMsgID, tgbotapi.InlineKeyboardMarkup{InlineKeyboard: [][]tgbotapi.InlineKeyboardButton{}})
-		bot.Send(edit)
+		if _, err := s.bot.Send(edit); err != nil {
+			log.Printf("Telegram edit error: %v", err)
+		}
 	}
 
-	processRequest(bot, chatID, lastURL, username, stats)
+	s.processRequest(chatID, lastURL, username)
 }
 
-func handleNext(bot *tgbotapi.BotAPI, query *tgbotapi.CallbackQuery, stats *Stats) {
+func (s *BotServer) handleNext(query *tgbotapi.CallbackQuery) {
 	chatID := query.Message.Chat.ID
 	username := getUsername(query.From)
-	bot.Request(tgbotapi.NewCallback(query.ID, "Loading next episode..."))
 
-	_, nextURL, lastMsgID, err := stats.getLastInfo(chatID)
+	_, nextURL, lastMsgID, err := s.stats.getLastInfo(chatID)
 	if err != nil || nextURL == "" {
-		send(bot, chatID, "No next episode found.")
+		send(s.bot, chatID, "No next episode found.")
 		return
 	}
 
 	if lastMsgID != 0 {
 		edit := tgbotapi.NewEditMessageReplyMarkup(chatID, lastMsgID, tgbotapi.InlineKeyboardMarkup{InlineKeyboard: [][]tgbotapi.InlineKeyboardButton{}})
-		bot.Send(edit)
+		if _, err := s.bot.Send(edit); err != nil {
+			log.Printf("Telegram edit error: %v", err)
+		}
 	}
 
-	processRequest(bot, chatID, nextURL, username, stats)
+	s.processRequest(chatID, nextURL, username)
 }
 
-func processRequest(bot *tgbotapi.BotAPI, chatID int64, pageURL string, username string, stats *Stats) {
-	_, _, oldMsgID, _ := stats.getLastInfo(chatID)
+func (s *BotServer) processRequest(chatID int64, pageURL string, username string) {
+	_, _, oldMsgID, _ := s.stats.getLastInfo(chatID)
 	if oldMsgID != 0 {
 		edit := tgbotapi.NewEditMessageReplyMarkup(chatID, oldMsgID, tgbotapi.InlineKeyboardMarkup{InlineKeyboard: [][]tgbotapi.InlineKeyboardButton{}})
-		bot.Send(edit)
+		if _, err := s.bot.Send(edit); err != nil {
+			log.Printf("Telegram edit error: %v", err)
+		}
 	}
 
-	stats.trackUser(chatID, username, pageURL)
-	loadingMsg, _ := bot.Send(tgbotapi.NewMessage(chatID, "Analyzing URL and fetching stream..."))
+	s.stats.trackUser(chatID, username, pageURL)
+	loadingMsg, err := s.bot.Send(tgbotapi.NewMessage(chatID, "Analyzing URL and fetching stream..."))
+	if err != nil {
+		log.Printf("Telegram send loading error: %v", err)
+	}
 
-	embedURL, nextURL, displayTitle, err := getKhdiamondStream(pageURL)
+	s.fetchLimiter <- struct{}{}
+	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
+	embedURL, nextURL, displayTitle, err := getKhdiamondStream(ctx, pageURL)
+	cancel()
+	<-s.fetchLimiter
 
 	if err != nil {
-		send(bot, chatID, fmt.Sprintf("Error: %s", err.Error()))
+		send(s.bot, chatID, fmt.Sprintf("Error: %s", err.Error()))
 	} else {
-		stats.updateNextURL(chatID, nextURL)
+		s.stats.updateNextURL(chatID, nextURL)
 		msgText := fmt.Sprintf("%s\n\nEmbed URL:\n%s", displayTitle, embedURL)
 		msg := tgbotapi.NewMessage(chatID, msgText)
 
@@ -477,13 +628,23 @@ func processRequest(bot *tgbotapi.BotAPI, chatID int64, pageURL string, username
 		}
 
 		msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(tgbotapi.NewInlineKeyboardRow(row...))
-		sentMsg, _ := bot.Send(msg)
-		stats.updateLastMessage(chatID, sentMsg.MessageID)
+		sentMsg, err := s.bot.Send(msg)
+		if err != nil {
+			log.Printf("Telegram send result error: %v", err)
+		} else {
+			s.stats.updateLastMessage(chatID, sentMsg.MessageID)
+		}
 	}
 
-	bot.Request(tgbotapi.NewDeleteMessage(chatID, loadingMsg.MessageID))
+	if loadingMsg.MessageID != 0 {
+		if _, err := s.bot.Request(tgbotapi.NewDeleteMessage(chatID, loadingMsg.MessageID)); err != nil {
+			log.Printf("Telegram delete loading error: %v", err)
+		}
+	}
 }
 
 func send(bot *tgbotapi.BotAPI, chatID int64, text string) {
-	bot.Send(tgbotapi.NewMessage(chatID, text))
+	if _, err := bot.Send(tgbotapi.NewMessage(chatID, text)); err != nil {
+		log.Printf("Telegram send error: %v", err)
+	}
 }
