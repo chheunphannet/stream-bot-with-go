@@ -148,6 +148,19 @@ func doRequest(method, targetURL, referer, bodyStr string) (string, error) {
 	args := []string{
 		"-sS", "-L", "-k", "--compressed",
 		"-X", method,
+		"-H", "Authority: khdiamond.net",
+		"-H", "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+		"-H", "Accept-Language: en-US,en;q=0.9",
+		"-H", "Cache-Control: max-age=0",
+		"-H", "Sec-Ch-Ua: \"Not A(Brand\";v=\"99\", \"Google Chrome\";v=\"120\", \"Chromium\";v=\"120\"",
+		"-H", "Sec-Ch-Ua-Mobile: ?0",
+		"-H", "Sec-Ch-Ua-Platform: \"Windows\"",
+		"-H", "Sec-Fetch-Dest: document",
+		"-H", "Sec-Fetch-Mode: navigate",
+		"-H", "Sec-Fetch-Site: none",
+		"-H", "Sec-Fetch-User: ?1",
+		"-H", "Upgrade-Insecure-Requests: 1",
+		"-H", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
 	}
 
 	if referer != "" {
@@ -156,6 +169,7 @@ func doRequest(method, targetURL, referer, bodyStr string) (string, error) {
 
 	if method == "POST" {
 		args = append(args, "-H", "Content-Type: application/x-www-form-urlencoded")
+		args = append(args, "-H", "X-Requested-With: XMLHttpRequest")
 		args = append(args, "-d", bodyStr)
 	}
 
@@ -172,7 +186,12 @@ func doRequest(method, targetURL, referer, bodyStr string) (string, error) {
 		return "", fmt.Errorf("curl_chrome120 error: %v, stderr: %s", err, stderr.String())
 	}
 
-	return out.String(), nil
+	resp := out.String()
+	if strings.Contains(resp, "Just a moment...") || strings.Contains(resp, "cf-challenge") {
+		return resp, fmt.Errorf("Cloudflare JS challenge detected. curl_chrome120 alone cannot solve this")
+	}
+
+	return resp, nil
 }
 
 func fetchHTML(pageURL, referer string) (string, error) {
